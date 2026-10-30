@@ -140,6 +140,7 @@ import {
   serverPaneSearchEntries,
 } from "./paneJump";
 import { sortAgentPanes } from "./agentOrder";
+import { markAgentOpened } from "./agentRecency";
 import {
   openServerSession,
   useAllServerAgentSessions,
@@ -1521,6 +1522,16 @@ export default function App() {
   const activePane = activePaneId
     ? s.panes.find((pane) => pane.pane_id === activePaneId)
     : undefined;
+  const openedAgentTerminalId = paneHasAgentHistory(activePane)
+    ? activePane.terminal_id
+    : undefined;
+  useEffect(() => {
+    if (!activePaneId || !openedAgentTerminalId) return;
+    markAgentOpened(s.activeConnectionId, {
+      pane_id: activePaneId,
+      terminal_id: openedAgentTerminalId,
+    });
+  }, [s.activeConnectionId, activePaneId, openedAgentTerminalId]);
   const activeTerminalComposerDraftKey =
     activePaneId && activePane?.terminal_id
       ? terminalComposerDraftKey(

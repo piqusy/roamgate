@@ -27,30 +27,31 @@ export function workspaceTabChips(
     "pane_id" | "tab_id" | "focused" | "agent" | "agent_status"
   >[],
 ): Map<string, WorkspaceTabChip[]> {
-  const panesByTab = new Map<string, typeof panes>();
-  for (const pane of panes) {
-    panesByTab.set(pane.tab_id, [...(panesByTab.get(pane.tab_id) ?? []), pane]);
-  }
   const chips = new Map<string, WorkspaceTabChip[]>();
+  const chipsByTab = new Map<string, WorkspaceTabChip>();
   for (const tab of tabs) {
-    const tabPanes = panesByTab.get(tab.tab_id) ?? [];
-    let status: AgentStateKind = "unknown";
-    for (const pane of tabPanes) {
-      if (!paneHasAgentHistory(pane)) continue;
-      const candidate = agentStateKind(pane.agent_status);
-      if (agentAttentionPriority(candidate) < agentAttentionPriority(status)) {
-        status = candidate;
-      }
-    }
     const chip: WorkspaceTabChip = {
       tabId: tab.tab_id,
       number: tab.number,
       label: tab.label,
       focused: tab.focused,
-      status,
-      paneId: (tabPanes.find((pane) => pane.focused) ?? tabPanes[0])?.pane_id,
+      status: "unknown",
+      paneId: undefined,
     };
-    chips.set(tab.workspace_id, [...(chips.get(tab.workspace_id) ?? []), chip]);
+    chipsByTab.set(tab.tab_id, chip);
+    const group = chips.get(tab.workspace_id);
+    if (group) group.push(chip);
+    else chips.set(tab.workspace_id, [chip]);
+  }
+  for (const pane of panes) {
+    const chip = chipsByTab.get(pane.tab_id);
+    if (!chip) continue;
+    if (!chip.paneId || pane.focused) chip.paneId = pane.pane_id;
+    if (!paneHasAgentHistory(pane)) continue;
+    const status = agentStateKind(pane.agent_status);
+    if (agentAttentionPriority(status) < agentAttentionPriority(chip.status)) {
+      chip.status = status;
+    }
   }
   return chips;
 }
@@ -78,20 +79,21 @@ export function visibleWorkspaceTabChips(
   visible: WorkspaceTabChip[];
   hidden: number;
 } {
-  if (
-    chips.length <= MAX_WORKSPACE_TAB_CHIPS &&
-    chipsWidth(chips.length) <= availableWidth
-  ) {
-    return { visible: [...chips], hidden: 0 };
-  }
-  let count = Math.min(MAX_WORKSPACE_TAB_CHIPS - 1, chips.length - 1);
+  let count = Math.min(
+    chips.length,
+    chips.length > MAX_WORKSPACE_TAB_CHIPS
+      ? MAX_WORKSPACE_TAB_CHIPS - 1
+      : MAX_WORKSPACE_TAB_CHIPS,
+  );
   while (
     count > 1 &&
-    chipsWidth(count) + WORKSPACE_TAB_CHIP_GAP + WORKSPACE_TAB_CHIP_MORE_WIDTH >
+    chipsWidth(count) +
+      (count < chips.length
+        ? WORKSPACE_TAB_CHIP_GAP + WORKSPACE_TAB_CHIP_MORE_WIDTH
+        : 0) >
       availableWidth
   ) {
     count -= 1;
   }
-  const visible = chips.slice(0, Math.max(1, count));
-  return { visible, hidden: chips.length - visible.length };
+  return { visible: chips.slice(0, count), hidden: chips.length - count };
 }

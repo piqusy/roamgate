@@ -151,6 +151,64 @@ describe("agent attention and grouping", () => {
     expect(
       parseAgentListPreferences('{"sort":"manual","grouping":"workspace"}'),
     ).toEqual({ sort: "manual", grouping: "workspace" });
+    expect(parseAgentListPreferences('{"sort":"recent"}').sort).toBe("recent");
+  });
+});
+
+describe("recently opened ordering", () => {
+  test("keeps attention groups first and ranks Idle by last open, then activity", () => {
+    const panes = [
+      { pane_id: "idle-active", agent_status: "idle", last_activity_at: 900 },
+      { pane_id: "idle-opened", agent_status: "idle", last_activity_at: 100 },
+      { pane_id: "done-old", agent_status: "done", last_activity_at: 200 },
+      { pane_id: "working", agent_status: "working" },
+      { pane_id: "idle-never", agent_status: "idle", last_activity_at: 50 },
+      { pane_id: "done-new", agent_status: "done", last_activity_at: 800 },
+      { pane_id: "blocked", agent_status: "blocked" },
+      { pane_id: "idle-older", agent_status: "idle", last_activity_at: 10 },
+    ];
+    const opened = new Map([
+      ["idle-opened", 5000],
+      ["idle-older", 4000],
+      ["working", 9000],
+    ]);
+    expect(
+      sortAgentPanes(
+        panes,
+        [],
+        "recent",
+        (pane) => opened.get(pane.pane_id) ?? 0,
+      ).map((pane) => pane.pane_id),
+    ).toEqual([
+      "blocked",
+      "done-new",
+      "done-old",
+      "working",
+      "idle-opened",
+      "idle-older",
+      "idle-active",
+      "idle-never",
+    ]);
+    expect(
+      sortAgentPanes(panes, [], "attention", () => {
+        throw new Error("Attention first must not read open history");
+      }).map((pane) => pane.pane_id),
+    ).toEqual([
+      "blocked",
+      "done-old",
+      "done-new",
+      "working",
+      "idle-active",
+      "idle-opened",
+      "idle-never",
+      "idle-older",
+    ]);
+    // Without open times, Idle falls back to the attention activity order.
+    expect(
+      sortAgentPanes(panes, [], "recent")
+        .filter((pane) => pane.agent_status === "idle")
+        .map((pane) => pane.pane_id),
+    ).toEqual(["idle-active", "idle-opened", "idle-never", "idle-older"]);
   });
 });
 

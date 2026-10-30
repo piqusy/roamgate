@@ -109,6 +109,9 @@ Inspector state is scoped to each checkout; see
   sidebar, switcher, command menu, Agent panel, and notifications.
 - Choose nested, **Separate**, or **Compact** agent views with optional
   attention-first ordering and grouping.
+- Sort **Separate** agents by **Recently opened**: blocked, done, and working
+  agents stay first, and idle agents follow the last time this browser opened
+  them. Open times stay in this browser's local storage.
 - Workspaces with several tabs show numbered tab chips colored by the most
   urgent agent state (working, blocked, done). Click a chip to open that tab,
   on any server. As the row narrows, extra tabs fold into a +N marker, down

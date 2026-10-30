@@ -419,9 +419,26 @@ if (process.env.ROAMGATE_APP_HISTORY_TEST !== "1") {
       const reload = (key: string) =>
         React.act(async () => root.render(<App key={key} />));
 
+      const { AGENT_RECENCY_STORAGE_KEY, agentRecencyKey, parseAgentRecency } =
+        await import("./agentRecency");
+      const opened = () =>
+        parseAgentRecency(
+          roamgateLocalStorage.getItem(AGENT_RECENCY_STORAGE_KEY),
+        );
+      const key = (id: string) =>
+        agentRecencyKey("local", panes.find((pane) => pane.pane_id === id)!);
+
       // An explicit Terminal choice survives switching and page reloads.
       expect(roamgateLocalStorage.getItem("mobileAgentView")).toBe("terminal");
       await switchSession("a");
+      expect(opened().get(key("a"))).toBeGreaterThan(0);
+      const openedA = opened().get(key("a"));
+      // Unrelated renders do not count as opening the active agent again.
+      await React.act(async () => {
+        snapshot = { ...snapshot };
+        for (const listener of listeners) listener();
+      });
+      expect(opened().get(key("a"))).toBe(openedA);
       expect(terminalProps.visible).toBe(true);
       expect(terminalProps.agentHistoryOpen).toBe(false);
       await reload("terminal");
@@ -430,12 +447,15 @@ if (process.env.ROAMGATE_APP_HISTORY_TEST !== "1") {
 
       await chooseChat();
       await switchSession("b");
+      expect(opened().get(key("b"))).toBeGreaterThan(0);
+      const openedC = opened().get(key("c"));
       expect(inspectorProps.visible).toBe(true);
       expect(inspectorProps.historyPane?.pane_id).toBe("b");
       expect(terminalProps.paneId).toBe("b");
       expect(terminalProps.agentHistoryOpen).toBe(true);
       expect(terminalProps.mobileInputTarget).not.toBeNull();
       await switchSession("c", false);
+      expect(opened().get(key("c"))).toBe(openedC);
       expect(terminalProps.visible).toBe(true);
       expect(terminalProps.agentHistoryOpen).toBe(false);
       expect(roamgateLocalStorage.getItem("mobileAgentView")).toBe("chat");
