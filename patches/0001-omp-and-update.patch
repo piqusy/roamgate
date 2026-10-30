@@ -1,8 +1,8 @@
 diff --git a/FEATURES.md b/FEATURES.md
-index 39406ea..f0bcae9 100644
+index 39406ea..c2800e5 100644
 --- a/FEATURES.md
 +++ b/FEATURES.md
-@@ -151,10 +151,12 @@ Inspector state is scoped to each checkout; see
+@@ -151,11 +151,15 @@ Inspector state is scoped to each checkout; see
    bundled agent integrations (not the agents themselves). See
    [version lookup](docs/ARCHITECTURE.md#agent-integrations).
  
@@ -10,17 +10,96 @@ index 39406ea..f0bcae9 100644
 -and Antigravity CLI**. Transcripts must be readable by the bridge. Over SSH,
 -Roamgate reads the session path Herdr reports; it never searches local files for
 -a remote pane. Muse needs session logging enabled (no `--no-session-log`).
-+Session inspection supports **Codex, Claude, Kimi, Grok Build, Pi, OMP, Muse Code,
-+and Antigravity CLI**. OMP sessions are discovered across local OMP profiles by
-+session ID; remote panes must report the transcript path because local profile
-+discovery is never used over SSH. Transcripts must be readable by the bridge.
-+Over SSH, Roamgate reads the session path Herdr reports; it never searches local
-+files for a remote pane. Muse needs session logging enabled (no `--no-session-log`).
- See [History synchronization](docs/HISTORY.md).
+-See [History synchronization](docs/HISTORY.md).
++- Session inspection supports **Codex, Claude, Kimi, Grok Build, Pi, OMP, Muse
++  Code, and Antigravity CLI**. OMP sessions are discovered across local profiles
++  and configured roots, including `PI_CONFIG_DIR` (resolved relative to the
++  user's home directory). Remote panes must report the transcript path because
++  local profile discovery is never used over SSH. Transcripts must be readable
++  by the bridge. Over SSH, Roamgate reads the session path Herdr reports; it
++  never searches local files for a remote pane. Muse needs session logging
++  enabled (no `--no-session-log`). See
++  [History synchronization](docs/HISTORY.md).
  
  ## Ranger
+ 
+diff --git a/server/src/agent/agent-sessions.test.ts b/server/src/agent/agent-sessions.test.ts
+index 76e1564..d812484 100644
+--- a/server/src/agent/agent-sessions.test.ts
++++ b/server/src/agent/agent-sessions.test.ts
+@@ -163,6 +163,70 @@ describe("Pi agent sessions", () => {
+       },
+     ]);
+   });
++  test("returns persisted OMP execution messages in endpoint history", async () => {
++    const path = remotePiSessionPath;
++    const records = [
++      { type: "session", version: 3, id: "omp-session", cwd: "/tmp/project" },
++      {
++        type: "message",
++        id: "execution-1",
++        timestamp: "2026-07-24T00:00:01.000Z",
++        message: {
++          role: "bashExecution",
++          command: "false",
++          output: "failure-output",
++          exitCode: 1,
++          cancelled: false,
++          timestamp: 1,
++        },
++      },
++    ];
++    const handlers = createAgentSessionHandlers({
++      herdrCall: async () => ({
++        agent: {
++          agent: "omp",
++          workspace_id: "w1",
++          tab_id: "t1",
++          cwd: "/tmp/project",
++          agent_session: {
++            source: "herdr:omp",
++            agent: "omp",
++            kind: "path",
++            value: path,
++          },
++        },
++      }),
++      files: remotePiFiles(
++        `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
++      ),
++    });
++    const history = await handlers.readHistory({
++      pane_id: "p1",
++      agent: "omp",
++      history_version: 2,
++    });
++
++    if (!("mode" in history) || history.mode !== "snapshot") {
++      throw new Error("Expected history snapshot");
++    }
++    expect(history.entries).toHaveLength(1);
++    expect(history.entries[0]).toMatchObject({
++      role: "tool",
++      kind: "tool_result",
++      tool_name: "bash",
++      is_error: true,
++      text: "",
++    });
++    const entry = await handlers.readEntry({
++      pane_id: "p1",
++      agent: "omp",
++      entry_id: history.entries[0]!.id,
++    });
++    expect(entry.text).toBe(
++      "Ran `false`\n\nOutput:\nfailure-output\n\nCommand exited with code 1",
++    );
++  });
++
+ 
+   test("includes Pi statistics and ATIF in Session Inspect", async () => {
+     const path = await createPiSession();
 diff --git a/server/src/agent/session-resolver.test.ts b/server/src/agent/session-resolver.test.ts
-index 1c9226c..8954d43 100644
+index 1c9226c..5f18e42 100644
 --- a/server/src/agent/session-resolver.test.ts
 +++ b/server/src/agent/session-resolver.test.ts
 @@ -1,4 +1,5 @@
@@ -29,13 +108,14 @@ index 1c9226c..8954d43 100644
  import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
  import { tmpdir } from "node:os";
  import { join } from "node:path";
-@@ -9,9 +10,15 @@ import {
+@@ -9,16 +10,51 @@ import {
  } from "./session-resolver";
  
  const tempDirectories: string[] = [];
 +const originalHome = process.env.HOME;
 +const originalXdgDataHome = process.env.XDG_DATA_HOME;
  const originalPiDirectory = process.env.PI_CODING_AGENT_DIR;
++const originalPiConfigDir = process.env.PI_CONFIG_DIR;
  
  afterEach(async () => {
 +  if (originalHome === undefined) delete process.env.HOME;
@@ -44,8 +124,10 @@ index 1c9226c..8954d43 100644
 +  else process.env.XDG_DATA_HOME = originalXdgDataHome;
    if (originalPiDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
    else process.env.PI_CODING_AGENT_DIR = originalPiDirectory;
++  if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
++  else process.env.PI_CONFIG_DIR = originalPiConfigDir;
    await Promise.all(
-@@ -19,6 +26,32 @@ afterEach(async () => {
+     tempDirectories.splice(0).map((path) => rm(path, { recursive: true })),
    );
  });
  
@@ -78,13 +160,14 @@ index 1c9226c..8954d43 100644
  describe("agent session resolver context", () => {
    test("keeps session path caches isolated per connection context", async () => {
      const root = await mkdtemp(join(tmpdir(), "herdr-gui-session-cache-"));
-@@ -67,3 +100,112 @@ describe("agent session resolver context", () => {
+@@ -67,3 +103,134 @@ describe("agent session resolver context", () => {
      expect(first.pathCache).not.toBe(second.pathCache);
    });
  });
 +
 +describe("OMP session resolution", () => {
 +  test("finds ids in the default OMP session directory", async () => {
++    delete process.env.PI_CONFIG_DIR;
 +    const root = await mkdtemp(join(tmpdir(), "roamgate-omp-"));
 +    tempDirectories.push(root);
 +    process.env.HOME = root;
@@ -119,10 +202,31 @@ index 1c9226c..8954d43 100644
 +    expect(result.path).toBe(sessionPath);
 +  });
 +
++  test.each([".omp-custom", "/absolute-omp-custom"])(
++    "finds sessions under PI_CONFIG_DIR=%s relative to home",
++    async (configDir) => {
++      const root = await mkdtemp(join(tmpdir(), "roamgate-omp-config-root-"));
++      tempDirectories.push(root);
++      process.env.HOME = root;
++      delete process.env.PI_CODING_AGENT_DIR;
++      delete process.env.XDG_DATA_HOME;
++      process.env.PI_CONFIG_DIR = configDir;
++      const sessionId = `session-${crypto.randomUUID()}`;
++      const sessionDirectory = join(root, configDir, "agent", "sessions");
++      const sessionPath = join(sessionDirectory, `${sessionId}.jsonl`);
++      await mkdir(sessionDirectory, { recursive: true });
++      await writeFile(sessionPath, "{}\n");
++      const result = resolveOmpSessionInFreshProcess(sessionId);
++      expect(result.status).toBe("ok");
++      expect(result.path).toBe(sessionPath);
++    },
++  );
++
 +  test("finds ids under a profile agent session directory", async () => {
 +    const root = await mkdtemp(join(tmpdir(), "roamgate-omp-profile-"));
 +    tempDirectories.push(root);
 +    process.env.HOME = root;
++    delete process.env.PI_CONFIG_DIR;
 +    delete process.env.PI_CODING_AGENT_DIR;
 +    const sessionId = `session-${crypto.randomUUID()}`;
 +    const sessionDirectory = join(root, ".omp", "profiles", "test-profile", "agent", "sessions");
@@ -192,7 +296,7 @@ index 1c9226c..8954d43 100644
 +  });
 +});
 diff --git a/server/src/agent/session-resolver.ts b/server/src/agent/session-resolver.ts
-index 0f7e585..3f0ff0a 100644
+index 0f7e585..b413b33 100644
 --- a/server/src/agent/session-resolver.ts
 +++ b/server/src/agent/session-resolver.ts
 @@ -1,4 +1,5 @@
@@ -201,7 +305,7 @@ index 0f7e585..3f0ff0a 100644
  import { readdir } from "node:fs/promises";
  import { homedir } from "node:os";
  import { basename, join, resolve } from "node:path";
-@@ -155,6 +156,60 @@ async function findPiSession(id: string, context: AgentSessionResolverContext) {
+@@ -155,6 +156,63 @@ async function findPiSession(id: string, context: AgentSessionResolverContext) {
    });
  }
  
@@ -210,7 +314,10 @@ index 0f7e585..3f0ff0a 100644
 +  context: AgentSessionResolverContext,
 +) {
 +  return resolveCachedSessionPath(context, `omp:${id}`, async () => {
-+    const ompRoot = join(homedir(), ".omp");
++    const configuredRoot = process.env.PI_CONFIG_DIR?.trim();
++    const ompRoot = configuredRoot
++      ? join(homedir(), configuredRoot)
++      : join(homedir(), ".omp");
 +    const roots = new Set([join(ompRoot, "agent", "sessions")]);
 +    const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
 +    if (xdgDataHome) {
@@ -262,7 +369,7 @@ index 0f7e585..3f0ff0a 100644
  function newestFile(paths: string[]) {
    return (
      paths
-@@ -207,7 +262,13 @@ async function sessionFileFor(
+@@ -207,7 +265,13 @@ async function sessionFileFor(
    if (agent === "claude")
      path = await findClaudeSession(session.value, context);
    if (agent === "kimi") path = await findKimiSession(session.value, context);
@@ -277,7 +384,7 @@ index 0f7e585..3f0ff0a 100644
    if (path) return files.statFile(path);
    return null;
  }
-@@ -267,11 +328,12 @@ export async function resolveAgentSessionInfo(
+@@ -267,11 +331,12 @@ export async function resolveAgentSessionInfo(
      agent !== "kimi" &&
      agent !== "grok" &&
      agent !== "pi" &&
@@ -292,10 +399,16 @@ index 0f7e585..3f0ff0a 100644
    }
    // Native session files follow the agent process, which may have been
 diff --git a/server/src/agent/session-trajectory.test.ts b/server/src/agent/session-trajectory.test.ts
-index dfebf3f..bc61737 100644
+index dfebf3f..7d0516f 100644
 --- a/server/src/agent/session-trajectory.test.ts
 +++ b/server/src/agent/session-trajectory.test.ts
-@@ -9,6 +9,43 @@ const sessionFile: SessionFile = {
+@@ -1,4 +1,5 @@
+ import { describe, expect, test } from "bun:test";
++import { historyEntriesFromTrajectory } from "./session-history";
+ import type { SessionFile } from "./session-types";
+ import { projectAgentTrajectory } from "./session-trajectory";
+ 
+@@ -9,6 +10,43 @@ const sessionFile: SessionFile = {
  };
  
  describe("agent session trajectory projection", () => {
@@ -339,8 +452,106 @@ index dfebf3f..bc61737 100644
    test("projects Codex sessions without duplicating user messages", () => {
      const trajectory = projectAgentTrajectory("codex", sessionFile, [
        {
+@@ -373,6 +411,97 @@ describe("agent session trajectory projection", () => {
+       error_message: "429 rate limit exceeded",
+     });
+   });
++  test("projects OMP bash and Python execution messages with output and status", () => {
++    const trajectory = projectAgentTrajectory("omp", sessionFile, [
++      {
++        type: "message",
++        id: "bash-1",
++        timestamp: "2026-07-07T00:00:01.000Z",
++        message: {
++          role: "bashExecution",
++          command: "false",
++          output: "failed",
++          exitCode: 1,
++          cancelled: false,
++        },
++      },
++      {
++        type: "message",
++        id: "python-1",
++        timestamp: "2026-07-07T00:00:02.000Z",
++        message: {
++          role: "pythonExecution",
++          code: "print('hello')",
++          output: "hello",
++          exitCode: 0,
++          cancelled: false,
++        },
++      },
++      {
++        type: "message",
++        id: "python-2",
++        timestamp: "2026-07-07T00:00:03.000Z",
++        message: {
++          role: "pythonExecution",
++          code: "raise SystemExit()",
++          output: "",
++          exitCode: 0,
++          cancelled: true,
++        },
++      },
++    ]);
++
++    expect(trajectory.steps.map((step) => step.source)).toEqual([
++      "system",
++      "system",
++      "system",
++    ]);
++    expect(trajectory.steps.map((step) => step.message)).toEqual([
++      "Ran `false`\n\nOutput:\nfailed\n\nCommand exited with code 1",
++      "Ran Python:\n```python\nprint('hello')\n```\n\nOutput:\nhello",
++      "Ran Python:\n```python\nraise SystemExit()\n```\n\n(no output)\n\nExecution cancelled",
++    ]);
++    expect(trajectory.steps[0]?.observation?.results[0]).toMatchObject({
++      content: "Ran `false`\n\nOutput:\nfailed\n\nCommand exited with code 1",
++      extra: {
++        tool_name: "bash",
++        command: "false",
++        exit_code: 1,
++        is_error: true,
++      },
++    });
++    expect(trajectory.steps[1]?.observation?.results[0]).toMatchObject({
++      content: "Ran Python:\n```python\nprint('hello')\n```\n\nOutput:\nhello",
++      extra: { tool_name: "python", code: "print('hello')", exit_code: 0 },
++    });
++    expect(trajectory.steps[2]?.observation?.results[0]?.extra).toMatchObject({
++      cancelled: true,
++      is_error: true,
++    });
++    expect(historyEntriesFromTrajectory(sessionFile, trajectory)).toMatchObject([
++      {
++        kind: "tool_result",
++        role: "tool",
++        tool_name: "bash",
++        text: "Ran `false`\n\nOutput:\nfailed\n\nCommand exited with code 1",
++        is_error: true,
++      },
++      {
++        kind: "tool_result",
++        role: "tool",
++        tool_name: "python",
++        text: "Ran Python:\n```python\nprint('hello')\n```\n\nOutput:\nhello",
++      },
++      {
++        kind: "tool_result",
++        role: "tool",
++        tool_name: "python",
++        text: "Ran Python:\n```python\nraise SystemExit()\n```\n\n(no output)\n\nExecution cancelled",
++        is_error: true,
++      },
++    ]);
++  });
++
+ 
+   test("projects Grok Build chat history into ATIF", () => {
+     const grokFile: SessionFile = {
 diff --git a/server/src/agent/session-trajectory.ts b/server/src/agent/session-trajectory.ts
-index 508b41f..8861c4e 100644
+index 508b41f..7a4ddfc 100644
 --- a/server/src/agent/session-trajectory.ts
 +++ b/server/src/agent/session-trajectory.ts
 @@ -33,7 +33,7 @@ function agentVersionFromRecords(
@@ -369,7 +580,60 @@ index 508b41f..8861c4e 100644
  ) {
    const steps: Omit<AtifStep, "step_id">[] = [];
    let modelName = file.modelName || "";
-@@ -715,7 +716,7 @@ function projectPiTrajectory(
+@@ -598,6 +599,52 @@ function projectPiTrajectory(
+       });
+       return;
+     }
++    if (role === "bashExecution" || role === "pythonExecution") {
++      const isBash = role === "bashExecution";
++      const command = stringValue(message.command);
++      const code = stringValue(message.code);
++      const output = toolOutputText(message.output);
++      const exitCode =
++        typeof message.exitCode === "number" ? message.exitCode : undefined;
++      const cancelled = message.cancelled === true;
++      const execution = isBash ? "Command" : "Execution";
++      const failed = cancelled || (exitCode !== undefined && exitCode !== 0);
++      const status = cancelled
++        ? `${execution} cancelled`
++        : exitCode !== undefined && exitCode !== 0
++          ? `${execution} exited with code ${exitCode}`
++          : "";
++      const sourceText = isBash
++        ? `Ran \`${command}\``
++        : `Ran Python:\n\`\`\`python\n${code}\n\`\`\``;
++      const outputText = output ? `Output:\n${output}` : "(no output)";
++      const content = [sourceText, outputText, status]
++        .filter(Boolean)
++        .join("\n\n");
++      steps.push({
++        timestamp,
++        source: "system",
++        message: content,
++        observation: {
++          results: [
++            {
++              content,
++              extra: {
++                tool_name: isBash ? "bash" : "python",
++                command: isBash ? command : undefined,
++                code: isBash ? undefined : code,
++                exit_code: exitCode,
++                cancelled: cancelled || undefined,
++                is_error: failed || undefined,
++              },
++            },
++          ],
++        },
++        extra: { record_type: type, role },
++      });
++      return;
++    }
++
+     if (role !== "assistant") return;
+ 
+     modelName = stringValue(message.model) || modelName;
+@@ -715,7 +762,7 @@ function projectPiTrajectory(
    });
  
    return createTrajectory(
@@ -378,7 +642,7 @@ index 508b41f..8861c4e 100644
      modelName ? { ...file, modelName } : file,
      records,
      steps,
-@@ -1119,7 +1120,8 @@ export function projectAgentTrajectory(
+@@ -1119,7 +1166,8 @@ export function projectAgentTrajectory(
    if (agent === "claude") return projectClaudeTrajectory(file, records);
    if (agent === "kimi") return projectKimiTrajectory(file, records);
    if (agent === "grok") return projectGrokTrajectory(file, records);
