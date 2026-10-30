@@ -39,7 +39,15 @@ cleanup() { rip "$tmp_root" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 source_dir="$tmp_root/source"
-git clone --quiet --depth 1 --branch "$tag" "$repo_url" "$source_dir"
+git clone --quiet --no-checkout --depth 1 "$repo_url" "$source_dir"
+git -C "$source_dir" fetch --quiet --depth 1 origin "refs/tags/$tag:refs/tags/$tag"
+git -C "$source_dir" checkout --quiet --detach "$tag^{commit}"
+resolved_commit=$(git -C "$source_dir" rev-parse HEAD)
+tag_commit=$(git -C "$source_dir" rev-parse "$tag^{commit}")
+[[ $resolved_commit == "$tag_commit" ]] || {
+  printf 'Checked out %s, expected %s for %s\n' "$resolved_commit" "$tag_commit" "$tag" >&2
+  exit 1
+}
 git -C "$source_dir" apply --check "$patch_file"
 git -C "$source_dir" apply "$patch_file"
 
