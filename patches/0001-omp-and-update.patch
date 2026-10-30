@@ -1,0 +1,1385 @@
+diff --git a/FEATURES.md b/FEATURES.md
+index 39406ea..f0bcae9 100644
+--- a/FEATURES.md
++++ b/FEATURES.md
+@@ -151,10 +151,12 @@ Inspector state is scoped to each checkout; see
+   bundled agent integrations (not the agents themselves). See
+   [version lookup](docs/ARCHITECTURE.md#agent-integrations).
+ 
+-Session inspection supports **Codex, Claude, Kimi, Grok Build, Pi, Muse Code,
+-and Antigravity CLI**. Transcripts must be readable by the bridge. Over SSH,
+-Roamgate reads the session path Herdr reports; it never searches local files for
+-a remote pane. Muse needs session logging enabled (no `--no-session-log`).
++Session inspection supports **Codex, Claude, Kimi, Grok Build, Pi, OMP, Muse Code,
++and Antigravity CLI**. OMP sessions are discovered across local OMP profiles by
++session ID; remote panes must report the transcript path because local profile
++discovery is never used over SSH. Transcripts must be readable by the bridge.
++Over SSH, Roamgate reads the session path Herdr reports; it never searches local
++files for a remote pane. Muse needs session logging enabled (no `--no-session-log`).
+ See [History synchronization](docs/HISTORY.md).
+ 
+ ## Ranger
+diff --git a/server/src/agent/session-resolver.test.ts b/server/src/agent/session-resolver.test.ts
+index 1c9226c..8954d43 100644
+--- a/server/src/agent/session-resolver.test.ts
++++ b/server/src/agent/session-resolver.test.ts
+@@ -1,4 +1,5 @@
+ import { afterEach, describe, expect, test } from "bun:test";
++import { spawnSync } from "node:child_process";
+ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+@@ -9,9 +10,15 @@ import {
+ } from "./session-resolver";
+ 
+ const tempDirectories: string[] = [];
++const originalHome = process.env.HOME;
++const originalXdgDataHome = process.env.XDG_DATA_HOME;
+ const originalPiDirectory = process.env.PI_CODING_AGENT_DIR;
+ 
+ afterEach(async () => {
++  if (originalHome === undefined) delete process.env.HOME;
++  else process.env.HOME = originalHome;
++  if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
++  else process.env.XDG_DATA_HOME = originalXdgDataHome;
+   if (originalPiDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+   else process.env.PI_CODING_AGENT_DIR = originalPiDirectory;
+   await Promise.all(
+@@ -19,6 +26,32 @@ afterEach(async () => {
+   );
+ });
+ 
++function resolveOmpSessionInFreshProcess(sessionId: string) {
++  const resolverUrl = new URL("./session-resolver.ts", import.meta.url).href;
++  const filesUrl = new URL("./session-file-access.ts", import.meta.url).href;
++  const script = `
++    import { resolveAgentSession } from ${JSON.stringify(resolverUrl)};
++    import { localAgentSessionFiles } from ${JSON.stringify(filesUrl)};
++    const result = await resolveAgentSession(
++      { pane_id: "p1" },
++      async () => ({ agent: { agent: "omp", agent_session: { agent: "omp", kind: "id", value: ${JSON.stringify(sessionId)} } } }),
++      localAgentSessionFiles,
++    );
++    console.log(JSON.stringify({ status: result.status, path: result.path }));
++  `;
++  const child = spawnSync(process.execPath, ["-e", script], {
++    encoding: "utf8",
++    env: {
++      ...process.env,
++      HOME: process.env.HOME,
++      PI_CODING_AGENT_DIR: "",
++      XDG_DATA_HOME: "",
++    },
++  });
++  if (child.status !== 0) throw new Error(child.stderr || "OMP resolver subprocess failed");
++  return JSON.parse(child.stdout.trim()) as { status: string; path: string };
++}
++
+ describe("agent session resolver context", () => {
+   test("keeps session path caches isolated per connection context", async () => {
+     const root = await mkdtemp(join(tmpdir(), "herdr-gui-session-cache-"));
+@@ -67,3 +100,112 @@ describe("agent session resolver context", () => {
+     expect(first.pathCache).not.toBe(second.pathCache);
+   });
+ });
++
++describe("OMP session resolution", () => {
++  test("finds ids in the default OMP session directory", async () => {
++    const root = await mkdtemp(join(tmpdir(), "roamgate-omp-"));
++    tempDirectories.push(root);
++    process.env.HOME = root;
++    delete process.env.PI_CODING_AGENT_DIR;
++    const sessionId = `session-${crypto.randomUUID()}`;
++    const sessionDirectory = join(root, ".omp", "agent", "sessions");
++    const sessionPath = join(sessionDirectory, `${sessionId}.jsonl`);
++    await mkdir(sessionDirectory, { recursive: true });
++    await writeFile(sessionPath, "{}\n");
++    const result = resolveOmpSessionInFreshProcess(sessionId);
++    expect(result.status).toBe("ok");
++    expect(result.path).toBe(sessionPath);
++  });
++
++  test("finds ids in a configured session directory", async () => {
++    const root = await mkdtemp(join(tmpdir(), "roamgate-omp-configured-"));
++    tempDirectories.push(root);
++    process.env.HOME = root;
++    const sessionId = `session-${crypto.randomUUID()}`;
++    const sessionDirectory = join(root, "custom-agent", "sessions");
++    const sessionPath = join(sessionDirectory, `prefix_${sessionId}.jsonl`);
++    await mkdir(sessionDirectory, { recursive: true });
++    await writeFile(sessionPath, "{}\n");
++    process.env.PI_CODING_AGENT_DIR = join(root, "custom-agent");
++    const result = await resolveAgentSession(
++      { pane_id: "p1" },
++      async () => ({ agent: { agent: "omp", agent_session: { agent: "omp", kind: "id", value: sessionId } } }),
++      localAgentSessionFiles,
++      createAgentSessionResolverContext(),
++    );
++    expect(result.status).toBe("ok");
++    expect(result.path).toBe(sessionPath);
++  });
++
++  test("finds ids under a profile agent session directory", async () => {
++    const root = await mkdtemp(join(tmpdir(), "roamgate-omp-profile-"));
++    tempDirectories.push(root);
++    process.env.HOME = root;
++    delete process.env.PI_CODING_AGENT_DIR;
++    const sessionId = `session-${crypto.randomUUID()}`;
++    const sessionDirectory = join(root, ".omp", "profiles", "test-profile", "agent", "sessions");
++    const sessionPath = join(sessionDirectory, `${sessionId}.jsonl`);
++    await mkdir(sessionDirectory, { recursive: true });
++    await writeFile(sessionPath, "{}\n");
++    const result = resolveOmpSessionInFreshProcess(sessionId);
++    expect(result.status).toBe("ok");
++    expect(result.path).toBe(sessionPath);
++  });
++
++  test("finds ids in the default XDG OMP session directory", async () => {
++    const root = await mkdtemp(join(tmpdir(), "roamgate-omp-xdg-"));
++    tempDirectories.push(root);
++    process.env.HOME = root;
++    process.env.XDG_DATA_HOME = join(root, "data");
++    delete process.env.PI_CODING_AGENT_DIR;
++    const sessionId = `session-${crypto.randomUUID()}`;
++    const sessionDirectory = join(root, "data", "omp", "sessions");
++    const sessionPath = join(sessionDirectory, `${sessionId}.jsonl`);
++    await mkdir(sessionDirectory, { recursive: true });
++    await writeFile(sessionPath, "{}\n");
++    const result = await resolveAgentSession(
++      { pane_id: "p1" },
++      async () => ({ agent: { agent: "omp", agent_session: { agent: "omp", kind: "id", value: sessionId } } }),
++      localAgentSessionFiles,
++      createAgentSessionResolverContext(),
++    );
++    expect(result.status).toBe("ok");
++    expect(result.path).toBe(sessionPath);
++  });
++
++  test("uses a reported transcript path for remote sessions without local ID discovery", async () => {
++    const remotePath = "/remote/.omp/profiles/work/agent/sessions/session.jsonl";
++    const files = {
++      remote: true,
++      statFile: async (path: string) => ({ path, mtimeMs: 1, size: 1, sessionId: null }),
++    } as unknown as typeof localAgentSessionFiles;
++    const direct = await resolveAgentSession(
++      { pane_id: "p1" },
++      async () => ({
++        agent: {
++          agent: "omp",
++          agent_session: { agent: "omp", kind: "path", value: remotePath },
++        },
++      }),
++      files,
++      createAgentSessionResolverContext(),
++    );
++    expect(direct.status).toBe("ok");
++    expect(direct.path).toBe(remotePath);
++
++    const remoteId = `remote-${crypto.randomUUID()}`;
++    const byId = await resolveAgentSession(
++      { pane_id: "p1" },
++      async () => ({
++        agent: {
++          agent: "omp",
++          agent_session: { agent: "omp", kind: "id", value: remoteId },
++        },
++      }),
++      files,
++      createAgentSessionResolverContext(),
++    );
++    expect(byId.status).toBe("missing_file");
++    expect(byId.path).toBe("");
++  });
++});
+diff --git a/server/src/agent/session-resolver.ts b/server/src/agent/session-resolver.ts
+index 0f7e585..3f0ff0a 100644
+--- a/server/src/agent/session-resolver.ts
++++ b/server/src/agent/session-resolver.ts
+@@ -1,4 +1,5 @@
+ import { existsSync, statSync } from "node:fs";
++import type { Dirent } from "node:fs";
+ import { readdir } from "node:fs/promises";
+ import { homedir } from "node:os";
+ import { basename, join, resolve } from "node:path";
+@@ -155,6 +156,60 @@ async function findPiSession(id: string, context: AgentSessionResolverContext) {
+   });
+ }
+ 
++async function findOmpSession(
++  id: string,
++  context: AgentSessionResolverContext,
++) {
++  return resolveCachedSessionPath(context, `omp:${id}`, async () => {
++    const ompRoot = join(homedir(), ".omp");
++    const roots = new Set([join(ompRoot, "agent", "sessions")]);
++    const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
++    if (xdgDataHome) {
++      const xdgRoot = resolve(xdgDataHome, "omp");
++      roots.add(join(xdgRoot, "sessions"));
++      let xdgProfiles: Dirent[];
++      try {
++        xdgProfiles = await readdir(join(xdgRoot, "profiles"), {
++          withFileTypes: true,
++        });
++      } catch {
++        xdgProfiles = [];
++      }
++      for (const profile of xdgProfiles) {
++        if (profile.isDirectory()) {
++          roots.add(join(xdgRoot, "profiles", profile.name, "sessions"));
++        }
++      }
++    }
++    if (process.env.PI_CODING_AGENT_DIR?.trim()) {
++      roots.add(join(piAgentDirectory(), "sessions"));
++    }
++    const profileRoot = join(ompRoot, "profiles");
++    let profiles: Dirent[];
++    try {
++      profiles = await readdir(profileRoot, { withFileTypes: true });
++    } catch {
++      profiles = [];
++    }
++    for (const profile of profiles) {
++      if (profile.isDirectory()) {
++        roots.add(join(profileRoot, profile.name, "agent", "sessions"));
++      }
++    }
++    const files = (
++      await Promise.all(
++        [...roots].map((root) =>
++          walkFiles(root, (path) => {
++            const name = basename(path);
++            return name === `${id}.jsonl` || name.endsWith(`_${id}.jsonl`);
++          }),
++        ),
++      )
++    ).flat();
++    return newestFile(files);
++  });
++}
++
+ function newestFile(paths: string[]) {
+   return (
+     paths
+@@ -207,7 +262,13 @@ async function sessionFileFor(
+   if (agent === "claude")
+     path = await findClaudeSession(session.value, context);
+   if (agent === "kimi") path = await findKimiSession(session.value, context);
+-  if (agent === "pi") path = await findPiSession(session.value, context);
++  if (agent === "pi" || agent === "omp")
++    path =
++      agent === "omp"
++        ? files.remote
++          ? null
++          : await findOmpSession(session.value, context)
++        : await findPiSession(session.value, context);
+   if (path) return files.statFile(path);
+   return null;
+ }
+@@ -267,11 +328,12 @@ export async function resolveAgentSessionInfo(
+     agent !== "kimi" &&
+     agent !== "grok" &&
+     agent !== "pi" &&
++    agent !== "omp" &&
+     agent !== "muse" &&
+     agent !== "agy"
+   ) {
+     throw new Error(
+-      `agent session only supports codex, claude, kimi, grok, pi, muse, and agy`,
++      `agent session only supports codex, claude, kimi, grok, pi, omp, muse, and agy`,
+     );
+   }
+   // Native session files follow the agent process, which may have been
+diff --git a/server/src/agent/session-trajectory.test.ts b/server/src/agent/session-trajectory.test.ts
+index dfebf3f..bc61737 100644
+--- a/server/src/agent/session-trajectory.test.ts
++++ b/server/src/agent/session-trajectory.test.ts
+@@ -9,6 +9,43 @@ const sessionFile: SessionFile = {
+ };
+ 
+ describe("agent session trajectory projection", () => {
++  test("projects OMP Pi-format sessions with header identity and version semantics", () => {
++    const trajectory = projectAgentTrajectory("omp", sessionFile, [
++      {
++        type: "session",
++        version: 3,
++        id: "header-session-id",
++        timestamp: "2026-07-07T00:00:00.000Z",
++        cwd: "/tmp/project",
++      },
++      {
++        type: "message",
++        id: "user-1",
++        timestamp: "2026-07-07T00:00:01.000Z",
++        message: { role: "user", content: "hello" },
++      },
++      {
++        type: "message",
++        id: "assistant-1",
++        timestamp: "2026-07-07T00:00:02.000Z",
++        message: {
++          role: "assistant",
++          content: [{ type: "text", text: "Hi there" }],
++          model: "test-model",
++        },
++      },
++    ]);
++
++    expect(trajectory.agent.name).toBe("omp");
++    expect(trajectory.agent.version).toBe("unknown");
++    expect(trajectory.session_id).toBe("header-session-id");
++    expect(trajectory.trajectory_id).toBe("header-session-id");
++    expect(trajectory.steps.map((step) => step.message)).toEqual([
++      "hello",
++      "Hi there",
++    ]);
++  });
++
+   test("projects Codex sessions without duplicating user messages", () => {
+     const trajectory = projectAgentTrajectory("codex", sessionFile, [
+       {
+diff --git a/server/src/agent/session-trajectory.ts b/server/src/agent/session-trajectory.ts
+index 508b41f..8861c4e 100644
+--- a/server/src/agent/session-trajectory.ts
++++ b/server/src/agent/session-trajectory.ts
+@@ -33,7 +33,7 @@ function agentVersionFromRecords(
+     const payload = isRecord(record.payload) ? record.payload : null;
+     const version =
+       stringValue(record.cli_version) ||
+-      (agent === "pi" && record.type === "session"
++      ((agent === "pi" || agent === "omp") && record.type === "session"
+         ? ""
+         : stringValue(record.version)) ||
+       stringValue(record.originator) ||
+@@ -102,7 +102,7 @@ function createTrajectory(
+     session_id: sessionId,
+     trajectory_id:
+       file.sessionId ||
+-      (agent === "pi"
++      (agent === "pi" || agent === "omp"
+         ? sessionId
+         : basename(file.path).replace(/\.[^.]+$/, "")),
+     agent: {
+@@ -547,6 +547,7 @@ function projectKimiTrajectory(
+ function projectPiTrajectory(
+   file: SessionFile,
+   records: Record<string, unknown>[],
++  agent = "pi",
+ ) {
+   const steps: Omit<AtifStep, "step_id">[] = [];
+   let modelName = file.modelName || "";
+@@ -715,7 +716,7 @@ function projectPiTrajectory(
+   });
+ 
+   return createTrajectory(
+-    "pi",
++    agent,
+     modelName ? { ...file, modelName } : file,
+     records,
+     steps,
+@@ -1119,7 +1120,8 @@ export function projectAgentTrajectory(
+   if (agent === "claude") return projectClaudeTrajectory(file, records);
+   if (agent === "kimi") return projectKimiTrajectory(file, records);
+   if (agent === "grok") return projectGrokTrajectory(file, records);
+-  if (agent === "pi") return projectPiTrajectory(file, records);
++  if (agent === "pi" || agent === "omp")
++    return projectPiTrajectory(file, records, agent);
+   if (agent === "muse") return projectMuseTrajectory(file, records);
+   if (agent === "agy") return projectAntigravityTrajectory(file, records);
+   return createTrajectory(agent, file, records, []);
+diff --git a/server/src/agent/session-utils.ts b/server/src/agent/session-utils.ts
+index 24b8ef7..5f84403 100644
+--- a/server/src/agent/session-utils.ts
++++ b/server/src/agent/session-utils.ts
+@@ -12,8 +12,13 @@ export function numberValue(value: unknown) {
+ 
+ export function normalizeAgentName(value: string) {
+   const normalized = value.trim().toLowerCase();
+-  if (normalized === "pi-agent" || normalized === "pi-coding-agent")
+-    return "pi";
++  if (
++    normalized === "pi-agent" ||
++    normalized === "pi-coding-agent" ||
++    normalized === "omp" ||
++    normalized === "oh-my-pi"
++  )
++    return normalized === "omp" || normalized === "oh-my-pi" ? "omp" : "pi";
+   if (normalized === "claude-code") return "claude";
+   if (normalized === "muse-code" || normalized === "muse code") return "muse";
+   if (normalized === "kimi-code" || normalized === "kimi code") return "kimi";
+diff --git a/server/src/cli/update.test.ts b/server/src/cli/update.test.ts
+index 4d9c59c..0ab0fcd 100644
+--- a/server/src/cli/update.test.ts
++++ b/server/src/cli/update.test.ts
+@@ -20,10 +20,20 @@ const manifest = (version: string) =>
+ 
+ function fakeProcess(version: string, installCode = 0) {
+   const calls: string[][] = [];
++  const options: Array<{
++    timeoutMs: number;
++    env?: NodeJS.ProcessEnv;
++  }> = [];
+   return {
+     calls,
+-    runProcess: async (argv: string[]) => {
++    options,
++    runProcess: async (
++      argv: string[],
++      timeoutMs: number,
++      processOptions?: { env?: NodeJS.ProcessEnv },
++    ) => {
+       calls.push(argv);
++      options.push({ timeoutMs, env: processOptions?.env });
+       return argv[0] === "curl"
+         ? { code: 0, stdout: manifest(version), stderr: "" }
+         : {
+@@ -68,32 +78,69 @@ describe("roamgate update", () => {
+     expect(cli.output.at(-1)).toBe("Up to date.");
+   });
+ 
+-  test("installs over the running executable with the shared verifier", async () => {
++  test("fails closed rather than installing a stock update", async () => {
+     cli = createTestCli();
+-    const fake = fakeProcess("1.3.0");
+-    expect(await createUpdateCommand(fake).run([], cli.context)).toBe(EXIT_OK);
+-    const [shell, flag, script] = fake.calls[1];
+-    expect([shell, flag]).toEqual(["sh", "-c"]);
+-    expect(script).toContain(`target='${cli.context.runtime.execPath}'`);
+-    expect(script).toContain(`expected_sha256='${"a".repeat(64)}'`);
+-    expect(script).toContain('backup="$target.previous"');
+-    expect(cli.output).toContain(
+-      `Installed roamgate 1.3.0 at ${cli.context.runtime.execPath}.`,
++    cli.context.runtime.env.HOME = cli.home;
++    expect(
++      await createUpdateCommand(fakeProcess("1.3.0")).run([], cli.context),
++    ).toBe(EXIT_FAILURE);
++    expect(cli.errors[0]).toContain("custom updater not found");
++  });
++
++  test("runs the home custom updater for available updates but not --check", async () => {
++    cli = createTestCli();
++    const customUpdater = join(
++      cli.home,
++      "development",
++      "roamgate-custom",
++      "update-custom.sh",
++    );
++    mkdirSync(join(cli.home, "development", "roamgate-custom"), {
++      recursive: true,
++    });
++    writeFileSync(customUpdater, "#!/bin/sh\n");
++    chmodSync(customUpdater, 0o755);
++    cli.context.runtime.env.HOME = cli.home;
++    const check = fakeProcess("1.3.0");
++    await createUpdateCommand(check).run(["--check"], cli.context);
++    expect(check.calls.every((argv) => argv[0] !== "bash")).toBe(true);
++
++    const update = fakeProcess("1.3.0");
++    expect(await createUpdateCommand(update).run([], cli.context)).toBe(EXIT_OK);
++    expect(update.calls.at(-1)).toEqual([
++      "bash",
++      customUpdater,
++      "v1.3.0",
++    ]);
++    expect(update.options.at(-1)?.timeoutMs).toBe(15 * 60 * 1000);
++    expect(update.options.at(-1)?.env?.ROAMGATE_CUSTOM_TARGET).toBe(
++      cli.context.runtime.execPath,
+     );
+   });
+ 
+-  test("reports installer failures and refuses source checkouts", async () => {
++  test("refuses custom updates from source checkouts", async () => {
+     cli = createTestCli();
+-    expect(
+-      await createUpdateCommand(fakeProcess("1.3.0", 1)).run([], cli.context),
+-    ).toBe(EXIT_FAILURE);
+-    expect(cli.errors[0]).toBe("roamgate update: checksum mismatch");
++    const customUpdater = join(
++      cli.home,
++      "development",
++      "roamgate-custom",
++      "update-custom.sh",
++    );
++    mkdirSync(join(cli.home, "development", "roamgate-custom"), {
++      recursive: true,
++    });
++    writeFileSync(customUpdater, "#!/bin/sh\n");
++    cli.context.runtime.env.HOME = cli.home;
+     cli.context.runtime.argv = ["bun", "/repo/server/src/index.ts"];
+-    expect(
+-      await createUpdateCommand(fakeProcess("1.3.0")).run([], cli.context),
+-    ).toBe(EXIT_FAILURE);
++    const update = fakeProcess("1.3.0");
++    expect(await createUpdateCommand(update).run([], cli.context)).toBe(
++      EXIT_FAILURE,
++    );
++    expect(cli.errors[0]).toContain("only the standalone binary");
++    expect(update.calls.some((argv) => argv[0] === "bash")).toBe(false);
+   });
+ 
++
+   test("explains platforms without update packages", async () => {
+     cli = createTestCli({ runtime: { platform: "win32" } });
+     expect(
+diff --git a/server/src/cli/update.ts b/server/src/cli/update.ts
+index 87d5661..5279885 100644
+--- a/server/src/cli/update.ts
++++ b/server/src/cli/update.ts
+@@ -1,4 +1,4 @@
+-import { lstatSync, readFileSync, renameSync } from "node:fs";
++import { existsSync, lstatSync, readFileSync, renameSync } from "node:fs";
+ import { basename, dirname, join } from "node:path";
+ import { roamgateEnv } from "../config/environment";
+ import {
+@@ -7,15 +7,17 @@ import {
+ } from "../config/service-definitions";
+ import {
+   compareVersion,
+-  curlTransportArgs,
+   fetchLatestUpdateManifest,
+   normalizeUpdateBaseUrl,
+-  renderUpdateInstallScript,
+   resolveUpdateTarget,
+   type RunProcessWithCodeTimeout,
+-  UPDATE_INSTALL_TIMEOUT_MS,
+ } from "../http/update";
+-import { runProcessWithCodeTimeout, shQuote } from "../utils/process-utils";
++import { runProcessWithCodeTimeout } from "../utils/process-utils";
++import {
++  readServiceSetup,
++  restartRunningService,
++  serviceStatus,
++} from "./service-context";
+ import {
+   type CliCommand,
+   type CliContext,
+@@ -26,18 +28,13 @@ import {
+   printJson,
+   wantsHelp,
+ } from "./command";
+-import {
+-  readServiceSetup,
+-  restartRunningService,
+-  serviceStatus,
+-} from "./service-context";
+ 
+ export interface UpdateDependencies {
+   runProcess?: RunProcessWithCodeTimeout;
+ }
+ 
+ function updateHelp(): string {
+-  return `Update the standalone roamgate executable to the latest release.
++  return `Build and install the latest custom roamgate release.
+ 
+ Usage:
+   roamgate update [--check] [--json]
+@@ -46,15 +43,12 @@ Options:
+   --check   only report whether a newer release exists
+   --json    print machine-readable output (with --check)
+ 
+-The release manifest, archive checksum, package VERSION and binary version are
+-verified before the executable is replaced in place. The previous executable is
+-kept as roamgate.previous; \`roamgate rollback\` restores it. A running managed
+-service that uses this executable is restarted afterwards.
++When an update is available, the custom source updater builds and installs it
++over this executable. The managed service is not restarted automatically; restart
++it manually after the update completes.
+ 
+ ROAMGATE_UPDATE_BASE_URL selects a mirror (from the shell, else the service
+-config). To install a specific version, rerun the installer with
+-ROAMGATE_VERSION=X.Y.Z. Windows builds update by downloading a release.
+-`;
++config).`;
+ }
+ 
+ function rollbackHelp(): string {
+@@ -162,43 +156,53 @@ export function createUpdateCommand(
+         }
+         return EXIT_OK;
+       }
++      const customUpdater = join(
++        runtime.env.HOME ?? process.env.HOME ?? runtime.homeDir,
++        "development",
++        "roamgate-custom",
++        "update-custom.sh",
++      );
+       if (!available) {
+         context.log(`roamgate ${context.version} is up to date.`);
+         return EXIT_OK;
+       }
+       if (!isStandaloneBinary(runtime)) {
+         context.error(
+-          "roamgate update: only the standalone binary can update itself; pull and rebuild source checkouts.",
++          "roamgate update: only the standalone binary can invoke the custom updater.",
++        );
++        return EXIT_FAILURE;
++      }
++      if (!existsSync(customUpdater)) {
++        context.error(
++          "roamgate update: custom updater not found; run `roamgate update` from the custom installation or restore $HOME/development/roamgate-custom/update-custom.sh.",
+         );
+         return EXIT_FAILURE;
+       }
+-
+       context.log(
+-        `Updating roamgate ${context.version} -> ${manifest.version}...`,
++        `Updating roamgate ${context.version} -> ${manifest.version} with the custom build...`,
+       );
+-      const script = renderUpdateInstallScript({
+-        targetPath: runtime.execPath,
+-        target,
+-        manifest,
+-        archiveUrl: `${baseUrl}/${target.archiveName}`,
+-        curlTransport: curlTransportArgs(baseUrl).map(shQuote).join(" "),
+-        shQuote,
+-      });
+       const result = await runProcess(
+-        ["sh", "-c", script],
+-        UPDATE_INSTALL_TIMEOUT_MS,
++        ["bash", customUpdater, `v${manifest.version}`],
++        15 * 60 * 1000,
++        {
++          env: {
++            ...process.env,
++            ...runtime.env,
++            ROAMGATE_CUSTOM_TARGET: runtime.execPath,
++          },
++        },
+       );
+       if (result.code !== 0) {
+         context.error(
+-          `roamgate update: ${(result.stderr || result.stdout || `install exited ${result.code}`).trim().slice(0, 1000)}`,
++          `roamgate update: ${(result.stderr || result.stdout || `custom update exited ${result.code}`).trim().slice(0, 1000)}`,
+         );
+         return EXIT_FAILURE;
+       }
++      if (result.stdout.trim()) context.log(result.stdout.trim());
+       context.log(
+-        `Installed roamgate ${manifest.version} at ${runtime.execPath}.`,
++        "Custom update installed. Restart the managed roamgate service manually to use it.",
+       );
+-      context.log(`Previous executable: ${runtime.execPath}.previous`);
+-      return restartServiceUsing(context, runtime.execPath);
++      return EXIT_OK;
+     },
+   };
+ }
+diff --git a/server/src/http/update-install.test.ts b/server/src/http/update-install.test.ts
+index 5b63b2a..38c502f 100644
+--- a/server/src/http/update-install.test.ts
++++ b/server/src/http/update-install.test.ts
+@@ -1,183 +1,38 @@
+ import { describe, expect, test } from "bun:test";
+-import { createHash } from "node:crypto";
+-import {
+-  existsSync,
+-  mkdirSync,
+-  mkdtempSync,
+-  readFileSync,
+-  rmSync,
+-  writeFileSync,
+-} from "node:fs";
+-import { tmpdir } from "node:os";
+-import { basename, join } from "node:path";
+-import { runProcessWithCodeTimeout, shQuote } from "../utils/process-utils";
+-import { createUpdateHandlers, resolveUpdateTarget } from "./update";
+-
+-function createUpdateFixture({ badDigest = false } = {}) {
+-  const target = resolveUpdateTarget(process.platform, process.arch);
+-  if (!target) {
+-    throw new Error(
+-      `unsupported test platform: ${process.platform}-${process.arch}`,
++import { createUpdateHandlers } from "./update";
++import { shQuote } from "../utils/process-utils";
++
++describe("web update installation", () => {
++  test("refuses installation and directs the user to the CLI", async () => {
++    let processInvoked = false;
++    const handlers = createUpdateHandlers({
++      appVersion: "9.8.6",
++      runProcessWithCodeTimeout: async () => {
++        processInvoked = true;
++        throw new Error("web updater must fail closed");
++      },
++      shQuote,
++      runtime: {
++        platform: process.platform,
++        arch: process.arch,
++        execPath: "/tmp/roamgate",
++        argv: ["/tmp/roamgate"],
++      },
++      environment: { HERDR_GUI_RESTART_SUPERVISOR: "1" },
++    });
++
++    const response = await handlers.handleUpdateInstall(
++      new Request("http://localhost/api/update/install", {
++        method: "POST",
++        headers: { "x-herdr-gui-update": "1" },
++      }),
+     );
+-  }
+-
+-  const root = mkdtempSync(join(tmpdir(), "roamgate-update-test-"));
+-  const assets = join(root, "assets");
+-  const packagePath = join(assets, target.packageDir);
+-  const installPath = join(root, "installed", "roamgate");
+-  mkdirSync(packagePath, { recursive: true });
+-  mkdirSync(join(root, "installed"), { recursive: true });
+-  writeFileSync(installPath, "old executable\n", { mode: 0o755 });
+-  writeFileSync(
+-    join(packagePath, "roamgate"),
+-    '#!/bin/sh\n[ "${1:-}" = "--version" ] && { echo "roamgate 9.8.7"; exit 0; }\nexit 1\n',
+-    { mode: 0o755 },
+-  );
+-  writeFileSync(
+-    join(packagePath, "VERSION"),
+-    `roamgate 9.8.7 ${target.platform}\n`,
+-  );
+-
+-  const archive = join(assets, target.archiveName);
+-  const packaged = Bun.spawnSync(
+-    ["tar", "-C", assets, "-cJf", archive, target.packageDir],
+-    {
+-      env: { ...process.env, COPYFILE_DISABLE: "1" },
+-      stderr: "pipe",
+-    },
+-  );
+-  if (packaged.exitCode !== 0) {
+-    throw new Error(packaged.stderr.toString());
+-  }
+-  const archiveDigest = createHash("sha256")
+-    .update(readFileSync(archive))
+-    .digest("hex");
+-  writeFileSync(
+-    join(assets, target.manifestName),
+-    JSON.stringify({
+-      schema: 1,
+-      name: "roamgate",
+-      version: "9.8.7",
+-      platform: target.platform,
+-      archive: target.archiveName,
+-      sha256: badDigest ? "0".repeat(64) : archiveDigest,
+-    }),
+-  );
+-
+-  const server = Bun.serve({
+-    hostname: "127.0.0.1",
+-    port: 0,
+-    async fetch(req) {
+-      const name = basename(new URL(req.url).pathname);
+-      const file = Bun.file(join(assets, name));
+-      return (await file.exists())
+-        ? new Response(file)
+-        : new Response("not found", { status: 404 });
+-    },
+-  });
+-
+-  return {
+-    root,
+-    installPath,
+-    baseUrl: `http://127.0.0.1:${server.port}`,
+-    cleanup() {
+-      server.stop(true);
+-      rmSync(root, { recursive: true, force: true });
+-    },
+-  };
+-}
+-
+-function installRequest() {
+-  return new Request("http://localhost/api/update/install", {
+-    method: "POST",
+-    headers: { "x-herdr-gui-update": "1" },
+-  });
+-}
+-
+-describe("automatic update installation", () => {
+-  test("verifies, narrows, and atomically replaces the running executable", async () => {
+-    const fixture = createUpdateFixture();
+-    let exitScheduled = false;
+-    try {
+-      const handlers = createUpdateHandlers({
+-        appVersion: "9.8.6",
+-        runProcessWithCodeTimeout,
+-        shQuote,
+-        runtime: {
+-          platform: process.platform,
+-          arch: process.arch,
+-          execPath: fixture.installPath,
+-          argv: [fixture.installPath],
+-        },
+-        environment: {
+-          HERDR_GUI_UPDATE_BASE_URL: fixture.baseUrl,
+-          HERDR_GUI_RESTART_SUPERVISOR: "1",
+-        },
+-        scheduleProcessExit: () => {
+-          exitScheduled = true;
+-        },
+-      });
+-
+-      const response = await handlers.handleUpdateInstall(installRequest());
+-      expect(response.status).toBe(200);
+-      expect(await response.json()).toMatchObject({
+-        ok: true,
+-        installed: true,
+-        installed_version: "9.8.7",
+-        target_path: fixture.installPath,
+-        backup_path: `${fixture.installPath}.previous`,
+-      });
+-      expect(exitScheduled).toBe(true);
+-      expect(readFileSync(`${fixture.installPath}.previous`, "utf8")).toBe(
+-        "old executable\n",
+-      );
+-      expect(
+-        Bun.spawnSync([fixture.installPath, "--version"], {
+-          stdout: "pipe",
+-        })
+-          .stdout.toString()
+-          .trim(),
+-      ).toBe("roamgate 9.8.7");
+-    } finally {
+-      fixture.cleanup();
+-    }
+-  });
+-
+-  test("keeps the old executable when the archive digest does not match", async () => {
+-    const fixture = createUpdateFixture({ badDigest: true });
+-    let exitScheduled = false;
+-    try {
+-      const handlers = createUpdateHandlers({
+-        appVersion: "9.8.6",
+-        runProcessWithCodeTimeout,
+-        shQuote,
+-        runtime: {
+-          platform: process.platform,
+-          arch: process.arch,
+-          execPath: fixture.installPath,
+-          argv: [fixture.installPath],
+-        },
+-        environment: {
+-          HERDR_GUI_UPDATE_BASE_URL: fixture.baseUrl,
+-          HERDR_GUI_RESTART_SUPERVISOR: "1",
+-        },
+-        scheduleProcessExit: () => {
+-          exitScheduled = true;
+-        },
+-      });
+ 
+-      const response = await handlers.handleUpdateInstall(installRequest());
+-      expect(response.status).toBe(500);
+-      expect(await response.json()).toMatchObject({
+-        error: "downloaded archive checksum does not match update manifest",
+-      });
+-      expect(exitScheduled).toBe(false);
+-      expect(readFileSync(fixture.installPath, "utf8")).toBe(
+-        "old executable\n",
+-      );
+-      expect(existsSync(`${fixture.installPath}.previous`)).toBe(false);
+-    } finally {
+-      fixture.cleanup();
+-    }
++    expect(response.status).toBe(409);
++    expect(await response.json()).toMatchObject({
++      error:
++        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install this update.",
++    });
++    expect(processInvoked).toBe(false);
+   });
+ });
+diff --git a/server/src/http/update.test.ts b/server/src/http/update.test.ts
+index cf70311..a0ea36f 100644
+--- a/server/src/http/update.test.ts
++++ b/server/src/http/update.test.ts
+@@ -213,7 +213,9 @@ describe("update helpers", () => {
+       current_version: "0.2.16",
+       latest_version: "0.2.17",
+       update_available: true,
+-      can_auto_update: true,
++      can_auto_update: false,
++      reason:
++        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
+       platform: "darwin-arm64",
+       source_url:
+         "https://github.com/powerfooI/roamgate/releases/latest/download/roamgate-darwin-arm64.tar.xz",
+@@ -246,7 +248,9 @@ describe("update helpers", () => {
+     expect(response.status).toBe(200);
+     expect(await response.json()).toMatchObject({
+       update_available: true,
+-      can_auto_update: true,
++      can_auto_update: false,
++      reason:
++        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
+       platform: "linux-x64",
+       source_url:
+         "https://github.com/powerfooI/roamgate/releases/latest/download/roamgate-linux-x64.tar.xz",
+@@ -441,7 +445,8 @@ describe("update helpers", () => {
+     expect(await response.json()).toMatchObject({
+       update_available: true,
+       can_auto_update: false,
+-      reason: "Auto update is only available in the standalone binary.",
++      reason:
++        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
+       platform: "darwin-arm64",
+     });
+   });
+@@ -465,7 +470,7 @@ describe("update helpers", () => {
+       update_available: true,
+       can_auto_update: false,
+       reason:
+-        "Automatic updates require an external process supervisor such as systemd or launchd.",
++        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
+       platform: "darwin-arm64",
+     });
+   });
+@@ -500,264 +505,27 @@ describe("update helpers", () => {
+     });
+   });
+ 
+-  test("rejects installation when no external supervisor owns restart", async () => {
+-    let callCount = 0;
+-    let exitScheduled = false;
++  test("refuses web installation and directs users to the CLI", async () => {
++    let calls = 0;
+     const handlers = createUpdateHandlers({
+       appVersion: "0.2.16",
+       runProcessWithCodeTimeout: async () => {
+-        callCount += 1;
+-        return {
+-          code: 0,
+-          stdout: updateManifest("0.2.17", "darwin-arm64"),
+-          stderr: "",
+-        };
+-      },
+-      shQuote,
+-      runtime: darwinRuntime,
+-      environment: {},
+-      scheduleProcessExit: () => {
+-        exitScheduled = true;
+-      },
+-    });
+-
+-    const response = await handlers.handleUpdateInstall(updateInstallRequest());
+-    expect(response.status).toBe(409);
+-    expect(await response.json()).toMatchObject({
+-      error:
+-        "Automatic updates require an external process supervisor such as systemd or launchd.",
+-      current_version: "0.2.16",
+-    });
+-    expect(callCount).toBe(0);
+-    expect(exitScheduled).toBe(false);
+-  });
+-
+-  test("rejects a release archive whose platform metadata does not match", async () => {
+-    const handlers = createUpdateHandlers({
+-      appVersion: "0.2.16",
+-      runProcessWithCodeTimeout: async () => ({
+-        code: 0,
+-        stdout: updateManifest("0.2.17", "linux-x64"),
+-        stderr: "",
+-      }),
+-      shQuote,
+-      runtime: darwinRuntime,
+-    });
+-
+-    const response = await handlers.handleUpdateCheck(updateCheckRequest());
+-    expect(response.status).toBe(502);
+-    expect(await response.json()).toMatchObject({
+-      error: "latest update platform is linux-x64, expected darwin-arm64",
+-    });
+-  });
+-
+-  test("installs a Darwin update and schedules only the managed process exit", async () => {
+-    const commands: string[][] = [];
+-    let exitScheduled = false;
+-    const handlers = createUpdateHandlers({
+-      appVersion: "0.2.16",
+-      runProcessWithCodeTimeout: async (argv) => {
+-        commands.push(argv);
+-        if (commands.length === 1) {
+-          return {
+-            code: 0,
+-            stdout: updateManifest("0.2.17", "darwin-arm64"),
+-            stderr: "",
+-          };
+-        }
+-        return { code: 0, stdout: "", stderr: "" };
++        calls += 1;
++        throw new Error("web updater must fail closed");
+       },
+       shQuote,
+       runtime: darwinRuntime,
+       environment: launchdEnvironment,
+-      scheduleProcessExit: () => {
+-        exitScheduled = true;
+-      },
+     });
+-
+-    const response = await handlers.handleUpdateInstall(updateInstallRequest());
+-    expect(response.status).toBe(200);
+-    expect(await response.json()).toMatchObject({
+-      ok: true,
+-      installed: true,
+-      installed_version: "0.2.17",
+-      restart_required: true,
+-      restart_scheduled: true,
+-      restart_mode: "supervisor",
+-      target_path: "/Applications/roamgate",
+-    });
+-    expect(commands).toHaveLength(2);
+-    const installCommand = commands[1][2];
+-    expect(installCommand).toContain("roamgate-darwin-arm64.tar.xz");
+-    expect(installCommand).not.toContain(".sha256");
+-    expect(installCommand).toContain(`expected_sha256='${updateSha256}'`);
+-    expect(installCommand).toContain('shasum -a 256 "$archive"');
+-    expect(installCommand).toContain('sha256sum "$archive"');
+-    expect(installCommand).toContain('version_file="$package_dir/VERSION"');
+-    expect(installCommand).toContain('binary="$package_dir/roamgate"');
+-    expect(installCommand).toContain('tar -xJf "$archive" -C "$tmp"');
+-    expect(installCommand).toContain("'roamgate-darwin-arm64/VERSION'");
+-    expect(installCommand).toContain("'roamgate-darwin-arm64/roamgate'");
+-    expect(installCommand).toContain("target='/Applications/roamgate'");
+-    expect(installCommand).toContain('backup="$target.previous"');
+-    expect(installCommand).toContain('mktemp "$target_dir/.$target_base.new.');
+-    expect(installCommand).not.toContain("roamgate-linux-x64");
+-    expect(
+-      Bun.spawnSync(["sh", "-n"], {
+-        stdin: Buffer.from(installCommand),
+-      }).exitCode,
+-    ).toBe(0);
+-    expect(exitScheduled).toBe(true);
+-  });
+-
+-  test("serializes update installs across connected clients", async () => {
+-    let releaseVersionCheck: () => void = () => {};
+-    let markVersionCheckStarted: () => void = () => {};
+-    const versionCheckStarted = new Promise<void>((resolve) => {
+-      markVersionCheckStarted = resolve;
+-    });
+-    const versionCheckGate = new Promise<void>((resolve) => {
+-      releaseVersionCheck = resolve;
+-    });
+-    let callCount = 0;
+-    const handlers = createUpdateHandlers({
+-      appVersion: "0.2.16",
+-      runProcessWithCodeTimeout: async () => {
+-        callCount += 1;
+-        if (callCount === 1) {
+-          markVersionCheckStarted();
+-          await versionCheckGate;
+-          return {
+-            code: 0,
+-            stdout: updateManifest("0.2.17", "darwin-arm64"),
+-            stderr: "",
+-          };
+-        }
+-        return { code: 0, stdout: "", stderr: "" };
+-      },
+-      shQuote,
+-      runtime: darwinRuntime,
+-      environment: launchdEnvironment,
+-      scheduleProcessExit: () => undefined,
+-    });
+-
+-    const firstInstall = handlers.handleUpdateInstall(updateInstallRequest());
+-    await versionCheckStarted;
+-    const concurrentResponse = await handlers.handleUpdateInstall(
+-      updateInstallRequest(),
+-    );
+-    expect(concurrentResponse.status).toBe(409);
+-    expect(await concurrentResponse.json()).toMatchObject({
+-      error: "An update installation is already in progress.",
+-    });
+-
+-    releaseVersionCheck();
+-    const firstResponse = await firstInstall;
+-    expect(firstResponse.status).toBe(200);
+-    expect(callCount).toBe(2);
+-    const restartWindowResponse = await handlers.handleUpdateInstall(
+-      updateInstallRequest(),
+-    );
+-    expect(restartWindowResponse.status).toBe(409);
+-    expect(callCount).toBe(2);
+-  });
+-
+-  test("does not download an update when the current version is latest", async () => {
+-    let callCount = 0;
+-    let exitScheduled = false;
+-    const handlers = createUpdateHandlers({
+-      appVersion: "0.2.17",
+-      runProcessWithCodeTimeout: async () => {
+-        callCount += 1;
+-        return {
+-          code: 0,
+-          stdout: updateManifest("0.2.17", "darwin-arm64"),
+-          stderr: "",
+-        };
+-      },
+-      shQuote,
+-      runtime: darwinRuntime,
+-      environment: launchdEnvironment,
+-      scheduleProcessExit: () => {
+-        exitScheduled = true;
+-      },
+-    });
+-
+-    const response = await handlers.handleUpdateInstall(updateInstallRequest());
+-    expect(response.status).toBe(200);
+-    expect(await response.json()).toMatchObject({
+-      ok: true,
+-      installed: false,
+-      current_version: "0.2.17",
+-      latest_version: "0.2.17",
+-      message: "Already up to date.",
+-    });
+-    expect(callCount).toBe(1);
+-    expect(exitScheduled).toBe(false);
+-  });
+-
+-  test("returns an install failure without scheduling a restart", async () => {
+-    let callCount = 0;
+-    let exitScheduled = false;
+-    const handlers = createUpdateHandlers({
+-      appVersion: "0.2.16",
+-      runProcessWithCodeTimeout: async () => {
+-        callCount += 1;
+-        return callCount % 2 === 1
+-          ? {
+-              code: 0,
+-              stdout: updateManifest("0.2.17", "darwin-arm64"),
+-              stderr: "",
+-            }
+-          : { code: 1, stdout: "", stderr: "install failed" };
+-      },
+-      shQuote,
+-      runtime: darwinRuntime,
+-      environment: launchdEnvironment,
+-      scheduleProcessExit: () => {
+-        exitScheduled = true;
+-      },
+-    });
+-
+-    const response = await handlers.handleUpdateInstall(updateInstallRequest());
+-    expect(response.status).toBe(500);
+-    expect(await response.json()).toMatchObject({
+-      error: "install failed",
+-      current_version: "0.2.16",
+-      latest_version: "0.2.17",
+-    });
+-    expect(callCount).toBe(2);
+-    expect(exitScheduled).toBe(false);
+-
+-    const retryResponse = await handlers.handleUpdateInstall(
+-      updateInstallRequest(),
+-    );
+-    expect(retryResponse.status).toBe(500);
+-    expect(callCount).toBe(4);
+-  });
+-
+-  test("rejects install requests on unsupported architectures before download", async () => {
+-    const handlers = createUpdateHandlers({
+-      appVersion: "0.2.16",
+-      runProcessWithCodeTimeout: async () => {
+-        throw new Error("should not run");
+-      },
+-      shQuote,
+-      runtime: {
+-        ...darwinRuntime,
+-        platform: "win32",
+-        arch: "x64",
+-      },
+-    });
+-
+     const response = await handlers.handleUpdateInstall(updateInstallRequest());
+     expect(response.status).toBe(409);
+     expect(await response.json()).toMatchObject({
+-      error: "Auto update is not available for win32-x64.",
+-      current_version: "0.2.16",
++      error: "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install this update.",
+     });
++    expect(calls).toBe(0);
+   });
+ 
++
+   test("reports disabled update checks without running curl", async () => {
+     const handlers = createUpdateHandlers({
+       appVersion: "0.2.6",
+diff --git a/server/src/http/update.ts b/server/src/http/update.ts
+index ae6bd98..c76e225 100644
+--- a/server/src/http/update.ts
++++ b/server/src/http/update.ts
+@@ -4,6 +4,7 @@ import { roamgateEnv } from "../config/environment";
+ export type RunProcessWithCodeTimeout = (
+   argv: string[],
+   timeoutMs: number,
++  options?: { cwd?: string; env?: NodeJS.ProcessEnv },
+ ) => Promise<{ code: number; stdout: string; stderr: string }>;
+ 
+ const UPDATE_PLATFORMS = [
+@@ -397,7 +398,6 @@ export function createUpdateHandlers({
+   } catch (error) {
+     updateBaseUrlError = error as Error;
+   }
+-  let updateInstallInProgress = false;
+   let latestManifestCache: {
+     expiresAt: number;
+     value: UpdateManifest;
+@@ -430,9 +430,6 @@ export function createUpdateHandlers({
+     };
+   }
+ 
+-  function curlTransportCommand(): string {
+-    return curlTransportArgs(updateBaseUrl()).map(shQuote).join(" ");
+-  }
+ 
+   function autoUpdateCapability(): {
+     canAutoUpdate: boolean;
+@@ -463,20 +460,6 @@ export function createUpdateHandlers({
+     return { canAutoUpdate: true, targetPath: runtime.execPath };
+   }
+ 
+-  // The updater owns replacement and shutdown only. An external supervisor
+-  // starts the new process after this response has had time to reach the client.
+-  function scheduleManagedExit() {
+-    if (scheduleProcessExitOverride) {
+-      scheduleProcessExitOverride();
+-      return;
+-    }
+-    const timer = setTimeout(() => {
+-      process.exit(0);
+-    }, 1000);
+-    if ("unref" in timer && typeof timer.unref === "function") {
+-      timer.unref();
+-    }
+-  }
+ 
+   async function loadLatestUpdateManifest(): Promise<UpdateManifest> {
+     if (!updateTarget) {
+@@ -545,8 +528,9 @@ export function createUpdateHandlers({
+       current_version: appVersion,
+       latest_version: latest.version,
+       update_available: compareVersion(latest.version, appVersion) > 0,
+-      can_auto_update: capability.canAutoUpdate,
+-      reason: capability.reason,
++      can_auto_update: false,
++      reason:
++        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
+       platform: latest.platform,
+       ...sourceDetails(),
+     };
+@@ -577,108 +561,15 @@ export function createUpdateHandlers({
+       );
+     }
+ 
+-    const capability = autoUpdateCapability();
+-    if (!updateTarget) {
+-      return updateJson(
+-        {
+-          error: capability.reason ?? "Auto update is not available.",
+-          current_version: appVersion,
+-          ...sourceDetails(),
+-        },
+-        { status: 409 },
+-      );
+-    }
+-    if (!capability.canAutoUpdate || !capability.targetPath) {
+-      return updateJson(
+-        {
+-          error: capability.reason ?? "Auto update is not available.",
+-          current_version: appVersion,
+-          ...sourceDetails(),
+-        },
+-        { status: 409 },
+-      );
+-    }
+-    if (updateBaseUrlError) {
+-      return updateJson(
+-        { error: updateBaseUrlError.message, current_version: appVersion },
+-        { status: 500 },
+-      );
+-    }
+-    if (updateInstallInProgress) {
+-      return updateJson(
+-        {
+-          error: "An update installation is already in progress.",
+-          current_version: appVersion,
+-        },
+-        { status: 409 },
+-      );
+-    }
+-
+-    updateInstallInProgress = true;
+-    let waitingForManagedRestart = false;
+-    try {
+-      const latest = await readLatestUpdateManifest(true);
+-      if (compareVersion(latest.version, appVersion) <= 0) {
+-        return updateJson({
+-          ok: true,
+-          installed: false,
+-          current_version: appVersion,
+-          latest_version: latest.version,
+-          message: "Already up to date.",
+-        });
+-      }
+-
+-      const command = renderUpdateInstallScript({
+-        targetPath: capability.targetPath,
+-        target: updateTarget,
+-        manifest: latest,
+-        archiveUrl: updateArchiveUrl(),
+-        curlTransport: curlTransportCommand(),
+-        shQuote,
+-      });
+-      const result = await runProcessWithCodeTimeout(
+-        ["sh", "-c", command],
+-        UPDATE_INSTALL_TIMEOUT_MS,
+-      );
+-      if (result.code !== 0) {
+-        return updateJson(
+-          {
+-            error: (
+-              result.stderr ||
+-              result.stdout ||
+-              `install exited ${result.code}`
+-            )
+-              .trim()
+-              .slice(0, 1000),
+-            current_version: appVersion,
+-            latest_version: latest.version,
+-          },
+-          { status: 500 },
+-        );
+-      }
+-      scheduleManagedExit();
+-      // Keep the lock until this process exits so another connected client
+-      // cannot start replacing the binary during the restart grace period.
+-      waitingForManagedRestart = true;
+-      return updateJson({
+-        ok: true,
+-        installed: true,
++    return updateJson(
++      {
++        error:
++          "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install this update.",
+         current_version: appVersion,
+-        installed_version: latest.version,
+-        restart_required: true,
+-        restart_scheduled: true,
+-        restart_mode: "supervisor",
+-        target_path: capability.targetPath,
+-        backup_path: `${capability.targetPath}.previous`,
+-      });
+-    } catch (e) {
+-      return updateJson(
+-        { error: (e as Error).message, ...sourceDetails() },
+-        { status: 500 },
+-      );
+-    } finally {
+-      if (!waitingForManagedRestart) updateInstallInProgress = false;
+-    }
++      },
++      { status: 409 },
++    );
++
+   }
+ 
+   return { handleUpdateCheck, handleUpdateInstall };

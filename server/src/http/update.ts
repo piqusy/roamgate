@@ -4,6 +4,7 @@ import { roamgateEnv } from "../config/environment";
 export type RunProcessWithCodeTimeout = (
   argv: string[],
   timeoutMs: number,
+  options?: { cwd?: string; env?: NodeJS.ProcessEnv },
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 const UPDATE_PLATFORMS = [
@@ -397,7 +398,6 @@ export function createUpdateHandlers({
   } catch (error) {
     updateBaseUrlError = error as Error;
   }
-  let updateInstallInProgress = false;
   let latestManifestCache: {
     expiresAt: number;
     value: UpdateManifest;
@@ -430,9 +430,6 @@ export function createUpdateHandlers({
     };
   }
 
-  function curlTransportCommand(): string {
-    return curlTransportArgs(updateBaseUrl()).map(shQuote).join(" ");
-  }
 
   function autoUpdateCapability(): {
     canAutoUpdate: boolean;
@@ -463,20 +460,6 @@ export function createUpdateHandlers({
     return { canAutoUpdate: true, targetPath: runtime.execPath };
   }
 
-  // The updater owns replacement and shutdown only. An external supervisor
-  // starts the new process after this response has had time to reach the client.
-  function scheduleManagedExit() {
-    if (scheduleProcessExitOverride) {
-      scheduleProcessExitOverride();
-      return;
-    }
-    const timer = setTimeout(() => {
-      process.exit(0);
-    }, 1000);
-    if ("unref" in timer && typeof timer.unref === "function") {
-      timer.unref();
-    }
-  }
 
   async function loadLatestUpdateManifest(): Promise<UpdateManifest> {
     if (!updateTarget) {
@@ -545,8 +528,9 @@ export function createUpdateHandlers({
       current_version: appVersion,
       latest_version: latest.version,
       update_available: compareVersion(latest.version, appVersion) > 0,
-      can_auto_update: capability.canAutoUpdate,
-      reason: capability.reason,
+      can_auto_update: false,
+      reason:
+        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
       platform: latest.platform,
       ...sourceDetails(),
     };
@@ -577,108 +561,15 @@ export function createUpdateHandlers({
       );
     }
 
-    const capability = autoUpdateCapability();
-    if (!updateTarget) {
-      return updateJson(
-        {
-          error: capability.reason ?? "Auto update is not available.",
-          current_version: appVersion,
-          ...sourceDetails(),
-        },
-        { status: 409 },
-      );
-    }
-    if (!capability.canAutoUpdate || !capability.targetPath) {
-      return updateJson(
-        {
-          error: capability.reason ?? "Auto update is not available.",
-          current_version: appVersion,
-          ...sourceDetails(),
-        },
-        { status: 409 },
-      );
-    }
-    if (updateBaseUrlError) {
-      return updateJson(
-        { error: updateBaseUrlError.message, current_version: appVersion },
-        { status: 500 },
-      );
-    }
-    if (updateInstallInProgress) {
-      return updateJson(
-        {
-          error: "An update installation is already in progress.",
-          current_version: appVersion,
-        },
-        { status: 409 },
-      );
-    }
-
-    updateInstallInProgress = true;
-    let waitingForManagedRestart = false;
-    try {
-      const latest = await readLatestUpdateManifest(true);
-      if (compareVersion(latest.version, appVersion) <= 0) {
-        return updateJson({
-          ok: true,
-          installed: false,
-          current_version: appVersion,
-          latest_version: latest.version,
-          message: "Already up to date.",
-        });
-      }
-
-      const command = renderUpdateInstallScript({
-        targetPath: capability.targetPath,
-        target: updateTarget,
-        manifest: latest,
-        archiveUrl: updateArchiveUrl(),
-        curlTransport: curlTransportCommand(),
-        shQuote,
-      });
-      const result = await runProcessWithCodeTimeout(
-        ["sh", "-c", command],
-        UPDATE_INSTALL_TIMEOUT_MS,
-      );
-      if (result.code !== 0) {
-        return updateJson(
-          {
-            error: (
-              result.stderr ||
-              result.stdout ||
-              `install exited ${result.code}`
-            )
-              .trim()
-              .slice(0, 1000),
-            current_version: appVersion,
-            latest_version: latest.version,
-          },
-          { status: 500 },
-        );
-      }
-      scheduleManagedExit();
-      // Keep the lock until this process exits so another connected client
-      // cannot start replacing the binary during the restart grace period.
-      waitingForManagedRestart = true;
-      return updateJson({
-        ok: true,
-        installed: true,
+    return updateJson(
+      {
+        error:
+          "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install this update.",
         current_version: appVersion,
-        installed_version: latest.version,
-        restart_required: true,
-        restart_scheduled: true,
-        restart_mode: "supervisor",
-        target_path: capability.targetPath,
-        backup_path: `${capability.targetPath}.previous`,
-      });
-    } catch (e) {
-      return updateJson(
-        { error: (e as Error).message, ...sourceDetails() },
-        { status: 500 },
-      );
-    } finally {
-      if (!waitingForManagedRestart) updateInstallInProgress = false;
-    }
+      },
+      { status: 409 },
+    );
+
   }
 
   return { handleUpdateCheck, handleUpdateInstall };

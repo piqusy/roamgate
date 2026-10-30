@@ -1,4 +1,5 @@
 import { existsSync, statSync } from "node:fs";
+import type { Dirent } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -155,6 +156,60 @@ async function findPiSession(id: string, context: AgentSessionResolverContext) {
   });
 }
 
+async function findOmpSession(
+  id: string,
+  context: AgentSessionResolverContext,
+) {
+  return resolveCachedSessionPath(context, `omp:${id}`, async () => {
+    const ompRoot = join(homedir(), ".omp");
+    const roots = new Set([join(ompRoot, "agent", "sessions")]);
+    const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
+    if (xdgDataHome) {
+      const xdgRoot = resolve(xdgDataHome, "omp");
+      roots.add(join(xdgRoot, "sessions"));
+      let xdgProfiles: Dirent[];
+      try {
+        xdgProfiles = await readdir(join(xdgRoot, "profiles"), {
+          withFileTypes: true,
+        });
+      } catch {
+        xdgProfiles = [];
+      }
+      for (const profile of xdgProfiles) {
+        if (profile.isDirectory()) {
+          roots.add(join(xdgRoot, "profiles", profile.name, "sessions"));
+        }
+      }
+    }
+    if (process.env.PI_CODING_AGENT_DIR?.trim()) {
+      roots.add(join(piAgentDirectory(), "sessions"));
+    }
+    const profileRoot = join(ompRoot, "profiles");
+    let profiles: Dirent[];
+    try {
+      profiles = await readdir(profileRoot, { withFileTypes: true });
+    } catch {
+      profiles = [];
+    }
+    for (const profile of profiles) {
+      if (profile.isDirectory()) {
+        roots.add(join(profileRoot, profile.name, "agent", "sessions"));
+      }
+    }
+    const files = (
+      await Promise.all(
+        [...roots].map((root) =>
+          walkFiles(root, (path) => {
+            const name = basename(path);
+            return name === `${id}.jsonl` || name.endsWith(`_${id}.jsonl`);
+          }),
+        ),
+      )
+    ).flat();
+    return newestFile(files);
+  });
+}
+
 function newestFile(paths: string[]) {
   return (
     paths
@@ -207,7 +262,13 @@ async function sessionFileFor(
   if (agent === "claude")
     path = await findClaudeSession(session.value, context);
   if (agent === "kimi") path = await findKimiSession(session.value, context);
-  if (agent === "pi") path = await findPiSession(session.value, context);
+  if (agent === "pi" || agent === "omp")
+    path =
+      agent === "omp"
+        ? files.remote
+          ? null
+          : await findOmpSession(session.value, context)
+        : await findPiSession(session.value, context);
   if (path) return files.statFile(path);
   return null;
 }
@@ -267,11 +328,12 @@ export async function resolveAgentSessionInfo(
     agent !== "kimi" &&
     agent !== "grok" &&
     agent !== "pi" &&
+    agent !== "omp" &&
     agent !== "muse" &&
     agent !== "agy"
   ) {
     throw new Error(
-      `agent session only supports codex, claude, kimi, grok, pi, muse, and agy`,
+      `agent session only supports codex, claude, kimi, grok, pi, omp, muse, and agy`,
     );
   }
   // Native session files follow the agent process, which may have been

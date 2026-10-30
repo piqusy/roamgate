@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, renameSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, renameSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { roamgateEnv } from "../config/environment";
 import {
@@ -7,15 +7,17 @@ import {
 } from "../config/service-definitions";
 import {
   compareVersion,
-  curlTransportArgs,
   fetchLatestUpdateManifest,
   normalizeUpdateBaseUrl,
-  renderUpdateInstallScript,
   resolveUpdateTarget,
   type RunProcessWithCodeTimeout,
-  UPDATE_INSTALL_TIMEOUT_MS,
 } from "../http/update";
-import { runProcessWithCodeTimeout, shQuote } from "../utils/process-utils";
+import { runProcessWithCodeTimeout } from "../utils/process-utils";
+import {
+  readServiceSetup,
+  restartRunningService,
+  serviceStatus,
+} from "./service-context";
 import {
   type CliCommand,
   type CliContext,
@@ -26,18 +28,13 @@ import {
   printJson,
   wantsHelp,
 } from "./command";
-import {
-  readServiceSetup,
-  restartRunningService,
-  serviceStatus,
-} from "./service-context";
 
 export interface UpdateDependencies {
   runProcess?: RunProcessWithCodeTimeout;
 }
 
 function updateHelp(): string {
-  return `Update the standalone roamgate executable to the latest release.
+  return `Build and install the latest custom roamgate release.
 
 Usage:
   roamgate update [--check] [--json]
@@ -46,15 +43,12 @@ Options:
   --check   only report whether a newer release exists
   --json    print machine-readable output (with --check)
 
-The release manifest, archive checksum, package VERSION and binary version are
-verified before the executable is replaced in place. The previous executable is
-kept as roamgate.previous; \`roamgate rollback\` restores it. A running managed
-service that uses this executable is restarted afterwards.
+When an update is available, the custom source updater builds and installs it
+over this executable. The managed service is not restarted automatically; restart
+it manually after the update completes.
 
 ROAMGATE_UPDATE_BASE_URL selects a mirror (from the shell, else the service
-config). To install a specific version, rerun the installer with
-ROAMGATE_VERSION=X.Y.Z. Windows builds update by downloading a release.
-`;
+config).`;
 }
 
 function rollbackHelp(): string {
@@ -162,43 +156,53 @@ export function createUpdateCommand(
         }
         return EXIT_OK;
       }
+      const customUpdater = join(
+        runtime.env.HOME ?? process.env.HOME ?? runtime.homeDir,
+        "development",
+        "roamgate-custom",
+        "update-custom.sh",
+      );
       if (!available) {
         context.log(`roamgate ${context.version} is up to date.`);
         return EXIT_OK;
       }
       if (!isStandaloneBinary(runtime)) {
         context.error(
-          "roamgate update: only the standalone binary can update itself; pull and rebuild source checkouts.",
+          "roamgate update: only the standalone binary can invoke the custom updater.",
         );
         return EXIT_FAILURE;
       }
-
+      if (!existsSync(customUpdater)) {
+        context.error(
+          "roamgate update: custom updater not found; run `roamgate update` from the custom installation or restore $HOME/development/roamgate-custom/update-custom.sh.",
+        );
+        return EXIT_FAILURE;
+      }
       context.log(
-        `Updating roamgate ${context.version} -> ${manifest.version}...`,
+        `Updating roamgate ${context.version} -> ${manifest.version} with the custom build...`,
       );
-      const script = renderUpdateInstallScript({
-        targetPath: runtime.execPath,
-        target,
-        manifest,
-        archiveUrl: `${baseUrl}/${target.archiveName}`,
-        curlTransport: curlTransportArgs(baseUrl).map(shQuote).join(" "),
-        shQuote,
-      });
       const result = await runProcess(
-        ["sh", "-c", script],
-        UPDATE_INSTALL_TIMEOUT_MS,
+        ["bash", customUpdater, `v${manifest.version}`],
+        15 * 60 * 1000,
+        {
+          env: {
+            ...process.env,
+            ...runtime.env,
+            ROAMGATE_CUSTOM_TARGET: runtime.execPath,
+          },
+        },
       );
       if (result.code !== 0) {
         context.error(
-          `roamgate update: ${(result.stderr || result.stdout || `install exited ${result.code}`).trim().slice(0, 1000)}`,
+          `roamgate update: ${(result.stderr || result.stdout || `custom update exited ${result.code}`).trim().slice(0, 1000)}`,
         );
         return EXIT_FAILURE;
       }
+      if (result.stdout.trim()) context.log(result.stdout.trim());
       context.log(
-        `Installed roamgate ${manifest.version} at ${runtime.execPath}.`,
+        "Custom update installed. Restart the managed roamgate service manually to use it.",
       );
-      context.log(`Previous executable: ${runtime.execPath}.previous`);
-      return restartServiceUsing(context, runtime.execPath);
+      return EXIT_OK;
     },
   };
 }

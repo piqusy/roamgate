@@ -20,10 +20,20 @@ const manifest = (version: string) =>
 
 function fakeProcess(version: string, installCode = 0) {
   const calls: string[][] = [];
+  const options: Array<{
+    timeoutMs: number;
+    env?: NodeJS.ProcessEnv;
+  }> = [];
   return {
     calls,
-    runProcess: async (argv: string[]) => {
+    options,
+    runProcess: async (
+      argv: string[],
+      timeoutMs: number,
+      processOptions?: { env?: NodeJS.ProcessEnv },
+    ) => {
       calls.push(argv);
+      options.push({ timeoutMs, env: processOptions?.env });
       return argv[0] === "curl"
         ? { code: 0, stdout: manifest(version), stderr: "" }
         : {
@@ -68,31 +78,68 @@ describe("roamgate update", () => {
     expect(cli.output.at(-1)).toBe("Up to date.");
   });
 
-  test("installs over the running executable with the shared verifier", async () => {
+  test("fails closed rather than installing a stock update", async () => {
     cli = createTestCli();
-    const fake = fakeProcess("1.3.0");
-    expect(await createUpdateCommand(fake).run([], cli.context)).toBe(EXIT_OK);
-    const [shell, flag, script] = fake.calls[1];
-    expect([shell, flag]).toEqual(["sh", "-c"]);
-    expect(script).toContain(`target='${cli.context.runtime.execPath}'`);
-    expect(script).toContain(`expected_sha256='${"a".repeat(64)}'`);
-    expect(script).toContain('backup="$target.previous"');
-    expect(cli.output).toContain(
-      `Installed roamgate 1.3.0 at ${cli.context.runtime.execPath}.`,
-    );
-  });
-
-  test("reports installer failures and refuses source checkouts", async () => {
-    cli = createTestCli();
-    expect(
-      await createUpdateCommand(fakeProcess("1.3.0", 1)).run([], cli.context),
-    ).toBe(EXIT_FAILURE);
-    expect(cli.errors[0]).toBe("roamgate update: checksum mismatch");
-    cli.context.runtime.argv = ["bun", "/repo/server/src/index.ts"];
+    cli.context.runtime.env.HOME = cli.home;
     expect(
       await createUpdateCommand(fakeProcess("1.3.0")).run([], cli.context),
     ).toBe(EXIT_FAILURE);
+    expect(cli.errors[0]).toContain("custom updater not found");
   });
+
+  test("runs the home custom updater for available updates but not --check", async () => {
+    cli = createTestCli();
+    const customUpdater = join(
+      cli.home,
+      "development",
+      "roamgate-custom",
+      "update-custom.sh",
+    );
+    mkdirSync(join(cli.home, "development", "roamgate-custom"), {
+      recursive: true,
+    });
+    writeFileSync(customUpdater, "#!/bin/sh\n");
+    chmodSync(customUpdater, 0o755);
+    cli.context.runtime.env.HOME = cli.home;
+    const check = fakeProcess("1.3.0");
+    await createUpdateCommand(check).run(["--check"], cli.context);
+    expect(check.calls.every((argv) => argv[0] !== "bash")).toBe(true);
+
+    const update = fakeProcess("1.3.0");
+    expect(await createUpdateCommand(update).run([], cli.context)).toBe(EXIT_OK);
+    expect(update.calls.at(-1)).toEqual([
+      "bash",
+      customUpdater,
+      "v1.3.0",
+    ]);
+    expect(update.options.at(-1)?.timeoutMs).toBe(15 * 60 * 1000);
+    expect(update.options.at(-1)?.env?.ROAMGATE_CUSTOM_TARGET).toBe(
+      cli.context.runtime.execPath,
+    );
+  });
+
+  test("refuses custom updates from source checkouts", async () => {
+    cli = createTestCli();
+    const customUpdater = join(
+      cli.home,
+      "development",
+      "roamgate-custom",
+      "update-custom.sh",
+    );
+    mkdirSync(join(cli.home, "development", "roamgate-custom"), {
+      recursive: true,
+    });
+    writeFileSync(customUpdater, "#!/bin/sh\n");
+    cli.context.runtime.env.HOME = cli.home;
+    cli.context.runtime.argv = ["bun", "/repo/server/src/index.ts"];
+    const update = fakeProcess("1.3.0");
+    expect(await createUpdateCommand(update).run([], cli.context)).toBe(
+      EXIT_FAILURE,
+    );
+    expect(cli.errors[0]).toContain("only the standalone binary");
+    expect(update.calls.some((argv) => argv[0] === "bash")).toBe(false);
+  });
+
 
   test("explains platforms without update packages", async () => {
     cli = createTestCli({ runtime: { platform: "win32" } });

@@ -213,7 +213,9 @@ describe("update helpers", () => {
       current_version: "0.2.16",
       latest_version: "0.2.17",
       update_available: true,
-      can_auto_update: true,
+      can_auto_update: false,
+      reason:
+        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
       platform: "darwin-arm64",
       source_url:
         "https://github.com/powerfooI/roamgate/releases/latest/download/roamgate-darwin-arm64.tar.xz",
@@ -246,7 +248,9 @@ describe("update helpers", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
       update_available: true,
-      can_auto_update: true,
+      can_auto_update: false,
+      reason:
+        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
       platform: "linux-x64",
       source_url:
         "https://github.com/powerfooI/roamgate/releases/latest/download/roamgate-linux-x64.tar.xz",
@@ -441,7 +445,8 @@ describe("update helpers", () => {
     expect(await response.json()).toMatchObject({
       update_available: true,
       can_auto_update: false,
-      reason: "Auto update is only available in the standalone binary.",
+      reason:
+        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
       platform: "darwin-arm64",
     });
   });
@@ -465,7 +470,7 @@ describe("update helpers", () => {
       update_available: true,
       can_auto_update: false,
       reason:
-        "Automatic updates require an external process supervisor such as systemd or launchd.",
+        "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install updates.",
       platform: "darwin-arm64",
     });
   });
@@ -500,263 +505,26 @@ describe("update helpers", () => {
     });
   });
 
-  test("rejects installation when no external supervisor owns restart", async () => {
-    let callCount = 0;
-    let exitScheduled = false;
+  test("refuses web installation and directs users to the CLI", async () => {
+    let calls = 0;
     const handlers = createUpdateHandlers({
       appVersion: "0.2.16",
       runProcessWithCodeTimeout: async () => {
-        callCount += 1;
-        return {
-          code: 0,
-          stdout: updateManifest("0.2.17", "darwin-arm64"),
-          stderr: "",
-        };
+        calls += 1;
+        throw new Error("web updater must fail closed");
       },
       shQuote,
       runtime: darwinRuntime,
-      environment: {},
-      scheduleProcessExit: () => {
-        exitScheduled = true;
-      },
+      environment: launchdEnvironment,
     });
-
     const response = await handlers.handleUpdateInstall(updateInstallRequest());
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({
-      error:
-        "Automatic updates require an external process supervisor such as systemd or launchd.",
-      current_version: "0.2.16",
+      error: "Web installation is disabled for custom builds; run `roamgate update` in the CLI to build and install this update.",
     });
-    expect(callCount).toBe(0);
-    expect(exitScheduled).toBe(false);
+    expect(calls).toBe(0);
   });
 
-  test("rejects a release archive whose platform metadata does not match", async () => {
-    const handlers = createUpdateHandlers({
-      appVersion: "0.2.16",
-      runProcessWithCodeTimeout: async () => ({
-        code: 0,
-        stdout: updateManifest("0.2.17", "linux-x64"),
-        stderr: "",
-      }),
-      shQuote,
-      runtime: darwinRuntime,
-    });
-
-    const response = await handlers.handleUpdateCheck(updateCheckRequest());
-    expect(response.status).toBe(502);
-    expect(await response.json()).toMatchObject({
-      error: "latest update platform is linux-x64, expected darwin-arm64",
-    });
-  });
-
-  test("installs a Darwin update and schedules only the managed process exit", async () => {
-    const commands: string[][] = [];
-    let exitScheduled = false;
-    const handlers = createUpdateHandlers({
-      appVersion: "0.2.16",
-      runProcessWithCodeTimeout: async (argv) => {
-        commands.push(argv);
-        if (commands.length === 1) {
-          return {
-            code: 0,
-            stdout: updateManifest("0.2.17", "darwin-arm64"),
-            stderr: "",
-          };
-        }
-        return { code: 0, stdout: "", stderr: "" };
-      },
-      shQuote,
-      runtime: darwinRuntime,
-      environment: launchdEnvironment,
-      scheduleProcessExit: () => {
-        exitScheduled = true;
-      },
-    });
-
-    const response = await handlers.handleUpdateInstall(updateInstallRequest());
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
-      ok: true,
-      installed: true,
-      installed_version: "0.2.17",
-      restart_required: true,
-      restart_scheduled: true,
-      restart_mode: "supervisor",
-      target_path: "/Applications/roamgate",
-    });
-    expect(commands).toHaveLength(2);
-    const installCommand = commands[1][2];
-    expect(installCommand).toContain("roamgate-darwin-arm64.tar.xz");
-    expect(installCommand).not.toContain(".sha256");
-    expect(installCommand).toContain(`expected_sha256='${updateSha256}'`);
-    expect(installCommand).toContain('shasum -a 256 "$archive"');
-    expect(installCommand).toContain('sha256sum "$archive"');
-    expect(installCommand).toContain('version_file="$package_dir/VERSION"');
-    expect(installCommand).toContain('binary="$package_dir/roamgate"');
-    expect(installCommand).toContain('tar -xJf "$archive" -C "$tmp"');
-    expect(installCommand).toContain("'roamgate-darwin-arm64/VERSION'");
-    expect(installCommand).toContain("'roamgate-darwin-arm64/roamgate'");
-    expect(installCommand).toContain("target='/Applications/roamgate'");
-    expect(installCommand).toContain('backup="$target.previous"');
-    expect(installCommand).toContain('mktemp "$target_dir/.$target_base.new.');
-    expect(installCommand).not.toContain("roamgate-linux-x64");
-    expect(
-      Bun.spawnSync(["sh", "-n"], {
-        stdin: Buffer.from(installCommand),
-      }).exitCode,
-    ).toBe(0);
-    expect(exitScheduled).toBe(true);
-  });
-
-  test("serializes update installs across connected clients", async () => {
-    let releaseVersionCheck: () => void = () => {};
-    let markVersionCheckStarted: () => void = () => {};
-    const versionCheckStarted = new Promise<void>((resolve) => {
-      markVersionCheckStarted = resolve;
-    });
-    const versionCheckGate = new Promise<void>((resolve) => {
-      releaseVersionCheck = resolve;
-    });
-    let callCount = 0;
-    const handlers = createUpdateHandlers({
-      appVersion: "0.2.16",
-      runProcessWithCodeTimeout: async () => {
-        callCount += 1;
-        if (callCount === 1) {
-          markVersionCheckStarted();
-          await versionCheckGate;
-          return {
-            code: 0,
-            stdout: updateManifest("0.2.17", "darwin-arm64"),
-            stderr: "",
-          };
-        }
-        return { code: 0, stdout: "", stderr: "" };
-      },
-      shQuote,
-      runtime: darwinRuntime,
-      environment: launchdEnvironment,
-      scheduleProcessExit: () => undefined,
-    });
-
-    const firstInstall = handlers.handleUpdateInstall(updateInstallRequest());
-    await versionCheckStarted;
-    const concurrentResponse = await handlers.handleUpdateInstall(
-      updateInstallRequest(),
-    );
-    expect(concurrentResponse.status).toBe(409);
-    expect(await concurrentResponse.json()).toMatchObject({
-      error: "An update installation is already in progress.",
-    });
-
-    releaseVersionCheck();
-    const firstResponse = await firstInstall;
-    expect(firstResponse.status).toBe(200);
-    expect(callCount).toBe(2);
-    const restartWindowResponse = await handlers.handleUpdateInstall(
-      updateInstallRequest(),
-    );
-    expect(restartWindowResponse.status).toBe(409);
-    expect(callCount).toBe(2);
-  });
-
-  test("does not download an update when the current version is latest", async () => {
-    let callCount = 0;
-    let exitScheduled = false;
-    const handlers = createUpdateHandlers({
-      appVersion: "0.2.17",
-      runProcessWithCodeTimeout: async () => {
-        callCount += 1;
-        return {
-          code: 0,
-          stdout: updateManifest("0.2.17", "darwin-arm64"),
-          stderr: "",
-        };
-      },
-      shQuote,
-      runtime: darwinRuntime,
-      environment: launchdEnvironment,
-      scheduleProcessExit: () => {
-        exitScheduled = true;
-      },
-    });
-
-    const response = await handlers.handleUpdateInstall(updateInstallRequest());
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
-      ok: true,
-      installed: false,
-      current_version: "0.2.17",
-      latest_version: "0.2.17",
-      message: "Already up to date.",
-    });
-    expect(callCount).toBe(1);
-    expect(exitScheduled).toBe(false);
-  });
-
-  test("returns an install failure without scheduling a restart", async () => {
-    let callCount = 0;
-    let exitScheduled = false;
-    const handlers = createUpdateHandlers({
-      appVersion: "0.2.16",
-      runProcessWithCodeTimeout: async () => {
-        callCount += 1;
-        return callCount % 2 === 1
-          ? {
-              code: 0,
-              stdout: updateManifest("0.2.17", "darwin-arm64"),
-              stderr: "",
-            }
-          : { code: 1, stdout: "", stderr: "install failed" };
-      },
-      shQuote,
-      runtime: darwinRuntime,
-      environment: launchdEnvironment,
-      scheduleProcessExit: () => {
-        exitScheduled = true;
-      },
-    });
-
-    const response = await handlers.handleUpdateInstall(updateInstallRequest());
-    expect(response.status).toBe(500);
-    expect(await response.json()).toMatchObject({
-      error: "install failed",
-      current_version: "0.2.16",
-      latest_version: "0.2.17",
-    });
-    expect(callCount).toBe(2);
-    expect(exitScheduled).toBe(false);
-
-    const retryResponse = await handlers.handleUpdateInstall(
-      updateInstallRequest(),
-    );
-    expect(retryResponse.status).toBe(500);
-    expect(callCount).toBe(4);
-  });
-
-  test("rejects install requests on unsupported architectures before download", async () => {
-    const handlers = createUpdateHandlers({
-      appVersion: "0.2.16",
-      runProcessWithCodeTimeout: async () => {
-        throw new Error("should not run");
-      },
-      shQuote,
-      runtime: {
-        ...darwinRuntime,
-        platform: "win32",
-        arch: "x64",
-      },
-    });
-
-    const response = await handlers.handleUpdateInstall(updateInstallRequest());
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({
-      error: "Auto update is not available for win32-x64.",
-      current_version: "0.2.16",
-    });
-  });
 
   test("reports disabled update checks without running curl", async () => {
     const handlers = createUpdateHandlers({
